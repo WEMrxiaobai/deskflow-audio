@@ -56,5 +56,8 @@ std::array<std::uint8_t, 30> sessionMediaKey(const Invitation &, const Nonce &);
 std::vector<std::uint8_t> controlPacket(const Invitation &, ControlType, const Nonce &);
 // Outputs are unchanged on failure. Stateless verification does NOT prevent replay.
 // Caller must erase its Invitation even when another operation throws.
-bool verifyControl(const Invitation &, std::span<const std::uint8_t>, ControlType &, Nonce &) noexcept;
+// enforceExpiry=false is ONLY for an already-connected endpoint and nonce.
+bool verifyControl(
+    const Invitation &, std::span<const std::uint8_t>, ControlType &, Nonce &, bool enforceExpiry = true
+) noexcept;
 } // namespace preview

@@ -378,13 +378,14 @@ std::vector<std::uint8_t> controlPacket(const Invitation &invite, ControlType ty
   return result;
 }
 bool verifyControl(
-    const Invitation &invite, std::span<const std::uint8_t> packet, ControlType &type, Nonce &nonce
+    const Invitation &invite, std::span<const std::uint8_t> packet, ControlType &type, Nonce &nonce, bool enforceExpiry
 ) noexcept
 {
   try {
     if (packet.size() != controlBytes || packet.size() > 128)
       return false;
-    validate(invite);
+    if (enforceExpiry)
+      validate(invite);
     if (!std::equal(magic.begin(), magic.end(), packet.begin()))
       return false;
     const auto candidateType = static_cast<ControlType>(packet[8]);

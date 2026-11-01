@@ -223,8 +223,16 @@ void lifecycle(Direction direction)
   const bool opened = probe.running.load() != 0;
   if (opened) {
     const auto generation = probe.generation.load();
-    if (direction == Direction::Render)
-      CHECK(await([&] { return probe.audioCalls.load() != 0; }, 3000));
+    CHECK(await([&] { return probe.audioCalls.load() != 0; }, 3000));
+    if (direction == Direction::LoopbackCapture) {
+      // No tone/render source is needed: an idle endpoint must keep producing
+      // PCM rather than allowing the receiver's one-second media timeout.
+      for (int i = 0; i < 20; ++i) {
+        const auto previous = probe.audioCalls.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(probe.audioCalls.load() > previous);
+      }
+    }
     // Keep a real stream active long enough to exercise repeated packet waits.
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     backend.requestRestart();

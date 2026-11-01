@@ -87,6 +87,7 @@ public:
     inline static const auto IgnoreMissingKeyboardLayouts = QStringLiteral("gui/ignoreMissingKeyboardLayouts");
     inline static const auto AudioListen = QStringLiteral("gui/audioListen");
     inline static const auto AudioLocalPlayback = QStringLiteral("gui/audioLocalPlayback");
+    inline static const auto AudioSourceControls = QStringLiteral("gui/audioSourceControls");
   };
   struct Log
   {
@@ -318,6 +319,7 @@ private:
     , Gui::IgnoreMissingKeyboardLayouts
     , Gui::AudioListen
     , Gui::AudioLocalPlayback
+    , Gui::AudioSourceControls
     , Security::Certificate
     , Security::CheckPeers
     , Security::KeySize
@@ -351,6 +353,7 @@ private:
     , Gui::IgnoreMissingKeyboardLayouts
     , Gui::AudioListen
     , Gui::AudioLocalPlayback
+    , Gui::AudioSourceControls
     , Core::PreventSleep
     , Core::EnableEnterCommand
     , Core::EnableExitCommand

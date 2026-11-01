@@ -27,6 +27,12 @@ install(
   DESTINATION ${CMAKE_INSTALL_DOCDIR}
 )
 
+if(WIN32 AND ENABLE_AUDIO_SHARING)
+  install(FILES dev/audio-sharing-integrated.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+    RENAME AudioSharingIntegrated.md)
+endif()
+
 # Make sure that help docs are moved.
 add_custom_command(
     TARGET docs PRE_BUILD

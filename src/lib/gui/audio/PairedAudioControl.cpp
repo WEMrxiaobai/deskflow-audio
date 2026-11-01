@@ -453,3 +453,8 @@ bool PairedAudioControl::isServer() const
 {
   return d->server;
 }
+QString PairedAudioControl::localAddress(const QString &id) const
+{
+  const auto *socket = d->peers.value(id);
+  return socket ? socket->localAddress().toString() : QString();
+}

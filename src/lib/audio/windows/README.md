@@ -50,7 +50,10 @@ playback can, naturally, appear in the loopback callbacks.
   `EVENTCALLBACK`, not `LOOPBACK`. Loopback therefore uses legacy shared
   `IAudioClient::Initialize(LOOPBACK | EVENTCALLBACK)`, with shared timer fallback.
   Bounded 1–10 ms wait timeouts drain packets even if a pre-Windows-10-1703
-  loopback event is never signalled. No extra render helper stream is opened.
+  loopback event is never signalled. Loopback also owns a shared render stream on
+  the same IMMDevice, replenished only with `AUDCLNT_BUFFERFLAGS_SILENT` buffers.
+  This keeps the Windows audio engine producing capture PCM while applications
+  are idle; both clients stop and release together on the same worker.
   OS scheduler timer resolution can make this fallback less precise; this code
   does not change the global timer resolution.
 - `GetMixFormat` is interpreted as float32, signed PCM16 or signed PCM32, either
@@ -64,9 +67,9 @@ playback can, naturally, appear in the loopback callbacks.
   exact endpoint format.
 - Capture drains available packets and propagates silent/discontinuity/timestamp
   metadata. `SILENT` packets are zero-filled **without touching their borrowed
-  data pointer**, which is allowed to be null. A silent endpoint need not deliver
-  any capture packets at all; the backend does not synthesize timestamps or
-  continuous fake silence in that case.
+  data pointer**, which is allowed to be null. The silent render stream sustains
+  idle capture; timestamps and PCM still come from WASAPI capture packets rather
+  than a second application clock or synthesized capture callbacks.
 - Scratch storage is allocated before `Start` from the current `GetBufferSize`.
   Format/capacity and scratch are rebuilt for every stream recreation. Unexpected
   packet sizes/padding beyond capacity cause teardown/retry; the audio loop

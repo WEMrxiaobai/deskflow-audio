@@ -118,6 +118,27 @@ int main()
     expired.expiresUnixSeconds = preview::unixSeconds() - 1;
     rejects([&] { (void)preview::controlPacket(expired, preview::ControlType::Hello, nonce); });
     preview::erase(expired);
+    auto shortLived = invite;
+    shortLived.expiresUnixSeconds = preview::unixSeconds() + 1;
+    auto establishedStop = preview::controlPacket(shortLived, preview::ControlType::Stop, nonce);
+    Sleep(2100);
+    preview::ControlType stopType{};
+    preview::Nonce stopNonce{};
+    check(
+        !preview::verifyControl(shortLived, establishedStop, stopType, stopNonce),
+        "Expired invitation allowed a new handshake"
+    );
+    check(
+        preview::verifyControl(shortLived, establishedStop, stopType, stopNonce, false) &&
+            stopType == preview::ControlType::Stop && stopNonce == nonce,
+        "Established connection lost authenticated control after invitation expiry"
+    );
+    establishedStop.back() ^= 1;
+    check(
+        !preview::verifyControl(shortLived, establishedStop, stopType, stopNonce, false),
+        "Established control accepted a bad HMAC after expiry"
+    );
+    preview::erase(shortLived);
     // Deliberate malformed plaintext only after deleting the validated generated test file.
     std::filesystem::remove(path);
     {

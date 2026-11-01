@@ -6,15 +6,50 @@
 #pragma once
 
 #include "Invitation.h"
+#include "audio/dsp/Pcm.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 
+namespace deskflow::audio::engine {
+class AudioReceiver;
+}
 namespace preview {
+// Shared only across serialized retries for the same paired peer. Releasing the
+// last owner restores local output. Never share between concurrently running sessions.
+struct LocalOutputState;
+std::shared_ptr<LocalOutputState> createLocalOutputState();
+// One playback device, one realtime mixer, and up to two independent receivers.
+// prepare/attach/detach run on serialized source workers, never the GUI/audio callback.
+class SharedPlayback final
+{
+public:
+  explicit SharedPlayback(bool test = false, bool testRender = false);
+  ~SharedPlayback();
+  SharedPlayback(const SharedPlayback &) = delete;
+  SharedPlayback &operator=(const SharedPlayback &) = delete;
+  deskflow::audio::dsp::PcmFormat prepare();
+  void attach(std::size_t slot, deskflow::audio::engine::AudioReceiver *receiver);
+  void detach(std::size_t slot) noexcept;
+  bool healthy() const noexcept;
+  std::uint64_t renderedCallbacks() const noexcept;
+  std::uint64_t twoSourceCallbacks() const noexcept;
+  float peak() const noexcept;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> d;
+};
+struct SourcePlaybackControl
+{
+  std::atomic<float> volume{.35f};
+  std::atomic<bool> muted{false};
+};
 enum class SessionState
 {
   Waiting,
@@ -37,9 +72,19 @@ struct SessionOptions
   bool test = false;
   bool testRender = false;
   bool testCapture = false;
+  double testToneHz = 440; // Explicit synthetic tests only; zero produces constant PCM.
+  std::chrono::milliseconds testDuration{5000};
+  std::shared_ptr<SharedPlayback> sharedPlayback;
+  std::size_t playbackSlot = 0;
+  std::shared_ptr<SourcePlaybackControl> playbackControl;
+  std::string expectedSenderAddress; // Group receiver: IPv4 observed by the authenticated broker.
   // Optional sender-only local output policy. Owner keeps this atomic alive until
   // worker joins. Null preserves legacy CLI/test behavior (no endpoint mutation).
   const std::atomic<bool> *localPlayback = nullptr;
+  std::shared_ptr<LocalOutputState> localOutputState;
+  // Paired GUI owns stop/retry over TLS; UDP teardown must not turn a retry
+  // into an explicit remote stop and release retained local mute ownership.
+  bool controlOwnsLifetime = false;
   // Sender: offer delivered over the existing authenticated Deskflow TLS channel.
   // Mutually exclusive with invitationPath; no discovery or peer authorization is
   // performed here. Caller owns and must erase this copy after the worker joins.

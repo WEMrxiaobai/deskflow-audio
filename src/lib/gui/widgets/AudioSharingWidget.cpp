@@ -7,12 +7,15 @@
 #include "Session.h"
 #include "common/Settings.h"
 #include "gui/audio/PairedAudioControl.h"
+#include "gui/audio/PairedAudioGroup.h"
 #include "gui/core/CoreProcess.h"
 #include <QCheckBox>
 #include <QHBoxLayout>
 #include <QHostAddress>
 #include <QLabel>
 #include <QPushButton>
+#include <QSignalBlocker>
+#include <QSlider>
 #include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -93,22 +96,79 @@ AudioSharingWidget::AudioSharingWidget(QWidget *parent)
   m_status->setTextFormat(Qt::PlainText);
   m_status->setMinimumHeight(fontMetrics().lineSpacing() * 2);
   layout->addWidget(m_status);
+  m_group = new PairedAudioGroup(m_control, &m_playLocally, this);
+  for (std::size_t i = 0; i < m_sourceRows.size(); ++i) {
+    auto &source = m_sourceRows[i];
+    source.container = new QWidget(this);
+    source.container->setObjectName(QStringLiteral("audioSourceRow%1").arg(i));
+    auto *sourceLayout = new QHBoxLayout(source.container);
+    sourceLayout->setContentsMargins(0, 0, 0, 0);
+    source.name = new QLabel(source.container);
+    source.name->setTextFormat(Qt::PlainText);
+    source.name->setMinimumWidth(130);
+    source.volume = new QSlider(Qt::Horizontal, source.container);
+    source.volume->setObjectName(QStringLiteral("audioSourceVolume%1").arg(i));
+    source.volume->setRange(0, 100);
+    source.volume->setAccessibleName(QStringLiteral("远端来源音量"));
+    source.mute = new QCheckBox(QStringLiteral("静音"), source.container);
+    source.mute->setObjectName(QStringLiteral("audioSourceMute%1").arg(i));
+    sourceLayout->addWidget(source.name);
+    sourceLayout->addWidget(source.volume, 1);
+    sourceLayout->addWidget(source.mute);
+    auto policy = source.container->sizePolicy();
+    policy.setRetainSizeWhenHidden(true);
+    source.container->setSizePolicy(policy);
+    source.container->hide();
+    layout->addWidget(source.container);
+    connect(source.volume, &QSlider::valueChanged, this, [this, i](int value) {
+      if (auto control = m_sourceRows[i].control) {
+        control->volume = float(value) / 100;
+        m_group->saveSourceControls();
+      }
+    });
+    connect(source.mute, &QCheckBox::toggled, this, [this, i](bool value) {
+      if (auto control = m_sourceRows[i].control) {
+        control->muted = value;
+        m_group->saveSourceControls();
+      }
+    });
+  }
+  connect(m_group, &PairedAudioGroup::modeChanged, this, [this](bool enabled) {
+    if (enabled)
+      stopSession();
+    refreshSources();
+    if (!enabled)
+      reconcile();
+  });
+  connect(m_group, &PairedAudioGroup::statusChanged, m_status, &QLabel::setText);
+  connect(m_group, &PairedAudioGroup::sourcesChanged, this, &AudioSharingWidget::refreshSources);
+  connect(m_group, &PairedAudioGroup::senderChanged, this, [this](bool sharing, bool overridden) {
+    m_stop->setVisible(sharing);
+    m_localPlayback->setVisible(sharing);
+    m_localPlayback->setEnabled(!overridden);
+    m_localPlayback->setToolTip(
+        overridden ? QStringLiteral("本机声音已由系统或用户调整；本次共享尊重该设置，下次共享恢复使用此选项。")
+                   : QStringLiteral("不勾选：共享连接成功后临时静音本机扬声器；停止共享后恢复。")
+    );
+  });
   connect(m_listen, &QCheckBox::toggled, this, [this](bool enabled) {
     Settings::setValue(Settings::Gui::AudioListen, enabled);
     Settings::save();
     m_senderPaused = false;
-    stopSession();
+    if (!m_group->enabled())
+      stopSession();
     advertise();
     reconcile();
   });
   connect(m_stop, &QPushButton::clicked, this, [this] {
     m_senderPaused = true;
-    stopSession();
+    if (!m_group->enabled())
+      stopSession();
     advertise();
     m_status->setText(QStringLiteral("已停止共享本机声音 · 键鼠保持连接"));
   });
   connect(m_control, &PairedAudioControl::statusChanged, this, [this](const QString &text) {
-    if (!m_running)
+    if (!m_running && !m_group->enabled())
       m_status->setText(text);
   });
   connect(m_control, &PairedAudioControl::peerConnected, this, [this](const QString &peer, const QString &name) {
@@ -128,6 +188,8 @@ AudioSharingWidget::AudioSharingWidget(QWidget *parent)
 AudioSharingWidget::~AudioSharingWidget()
 {
   m_destroying = true;
+  disconnect(m_group, nullptr, this, nullptr);
+  m_group->shutdown();
   // Children outlive C++ members until QObject's base destructor. Prevent the
   // controller's shutdown signals from reaching already-destroyed member state.
   disconnect(m_control, nullptr, this, nullptr);
@@ -135,6 +197,7 @@ AudioSharingWidget::~AudioSharingWidget()
   m_stopRequested = true;
   if (m_worker.joinable())
     m_worker.join();
+  m_localOutputState.reset();
 }
 void AudioSharingWidget::attach(deskflow::gui::CoreProcess *core)
 {
@@ -166,7 +229,7 @@ void AudioSharingWidget::updateConnection()
   const bool ready =
       m_core->isStarted() &&
       (server ? !m_connectedNames.isEmpty() : m_core->connectionState() == deskflow::core::ConnectionState::Connected);
-  if (!ready && m_running)
+  if (!ready && (m_running || m_localOutputState))
     stopSession(false);
   m_control->configure(server, ready, Settings::value(Settings::Client::RemoteHost).toString(), m_connectedNames);
   if (!ready && !m_running)
@@ -174,8 +237,12 @@ void AudioSharingWidget::updateConnection()
 }
 void AudioSharingWidget::advertise()
 {
+  m_group->setLocalState(m_listen->isChecked(), !m_senderPaused);
   for (const auto &peer : m_control->peerIds())
-    m_control->send(peer, {{"type", "state"}, {"listen", m_listen->isChecked()}, {"available", !m_senderPaused}});
+    m_control->send(
+        peer,
+        {{"type", "state"}, {"listen", m_listen->isChecked()}, {"available", !m_senderPaused}, {"audioVersion", 2}}
+    );
 }
 bool AudioSharingWidget::shouldReceive(const QString &peer) const
 {
@@ -188,7 +255,7 @@ bool AudioSharingWidget::shouldSend(const QString &peer) const
 }
 void AudioSharingWidget::reconcile()
 {
-  if (m_destroying || m_running)
+  if (m_destroying || m_group->enabled() || m_running || (m_retryClock.isValid() && m_retryClock.elapsed() < 2000))
     return;
   auto peers = m_control->peerIds();
   peers.sort();
@@ -206,13 +273,20 @@ void AudioSharingWidget::reconcile()
 }
 void AudioSharingWidget::handleMessage(const QString &peer, const QJsonObject &message)
 {
+  if (message.value("type") == "state" && message.value("listen").isBool() && message.value("available").isBool()) {
+    // Keep fallback state even while the hub coordinates a multi-source group.
+    m_remoteListen[peer] = message.value("listen").toBool();
+    m_remoteAvailable[peer] = message.value("available").toBool();
+  }
+  if (m_group->handleMessage(peer, message))
+    return;
   const auto type = message.value("type").toString();
   if (type == "state") {
     if (!message.value("listen").isBool() || !message.value("available").isBool())
       return;
     m_remoteListen[peer] = message.value("listen").toBool();
     m_remoteAvailable[peer] = message.value("available").toBool();
-    if (m_activePeer == peer && m_running && !(m_receive ? shouldReceive(peer) : shouldSend(peer)))
+    if (m_activePeer == peer && !(m_receive ? shouldReceive(peer) : shouldSend(peer)))
       stopSession();
     reconcile();
     return;
@@ -222,30 +296,57 @@ void AudioSharingWidget::handleMessage(const QString &peer, const QJsonObject &m
     return;
   if (type == "stop") {
     if (peer == m_activePeer && session == m_session)
-      stopSession(false);
+      stopSession(false, message.value("retry").toBool());
     return;
   }
-  if (type == "offer" && shouldSend(peer) && !m_running) {
+  if (type == "offer" && shouldSend(peer) &&
+      (!m_running || (m_activePeer == peer && !m_receive && m_session != session))) {
     preview::Invitation offer;
-    if (readOffer(message.value("offer").toObject(), m_control->peerAddress(peer), offer))
+    if (readOffer(message.value("offer").toObject(), m_control->peerAddress(peer), offer)) {
+      // A fresh authenticated offer supersedes this peer's old sending worker.
+      // Preserve mute until the replacement has connected, avoiding a local burst.
+      stopSession(false, m_activePeer == peer && !m_receive);
       startSession(peer, false, session, &offer);
+    }
     preview::erase(offer);
   }
 }
-void AudioSharingWidget::stopSession(bool inform)
+void AudioSharingWidget::refreshSources()
 {
-  if (!m_running)
-    return;
-  if (inform)
-    m_control->send(m_activePeer, {{"type", "stop"}, {"session", m_session}});
+  const auto sources = m_group->sources();
+  for (std::size_t i = 0; i < m_sourceRows.size(); ++i) {
+    auto &row = m_sourceRows[i];
+    row.control = i < sources.size() ? sources[i].control : nullptr;
+    row.container->setVisible(bool(row.control));
+    if (!row.control)
+      continue;
+    const auto label = sources[i].name + QStringLiteral(" · ") + sources[i].status;
+    row.name->setText(row.name->fontMetrics().elidedText(label, Qt::ElideRight, 210));
+    row.name->setToolTip(label);
+    const QSignalBlocker volumeBlock(row.volume), muteBlock(row.mute);
+    row.volume->setValue(qRound(row.control->volume.load() * 100));
+    row.mute->setChecked(row.control->muted.load());
+  }
+}
+void AudioSharingWidget::stopSession(bool inform, bool retry)
+{
+  if (inform && !m_session.isEmpty())
+    m_control->send(m_activePeer, {{"type", "stop"}, {"session", m_session}, {"retry", retry}});
   ++m_generation;
   m_stopRequested = true;
   if (m_worker.joinable())
     m_worker.join();
   m_running = false;
-  m_activePeer.clear();
-  m_session.clear();
-  m_stop->setVisible(false);
+  if (retry) {
+    m_retryClock.start();
+    m_status->setText(QStringLiteral("音频连接中断，正在自动重试 · 重连期间保持本机播放设置"));
+  } else {
+    m_retryClock.invalidate();
+    m_localOutputState.reset();
+    m_activePeer.clear();
+    m_session.clear();
+  }
+  m_stop->setVisible(retry && bool(m_localOutputState));
   if (m_localPlayback)
     m_localPlayback->setVisible(false);
 }
@@ -262,6 +363,7 @@ void AudioSharingWidget::startSession(
   m_localPlaybackOverridden = false;
   m_localPlayback->setEnabled(true);
   m_running = true;
+  m_retryClock.invalidate();
   const auto generation = ++m_generation;
   m_stop->setVisible(!receive);
   m_localPlayback->setVisible(!receive);
@@ -274,8 +376,13 @@ void AudioSharingWidget::startSession(
       });
   auto &options = *ownedOptions;
   options.receive = receive;
-  if (!receive)
+  options.controlOwnsLifetime = true;
+  if (!receive) {
     options.localPlayback = &m_playLocally;
+    if (!m_localOutputState)
+      m_localOutputState = preview::createLocalOutputState();
+    options.localOutputState = m_localOutputState;
+  }
   if (offer)
     options.invitation = *offer;
   if (receive)
@@ -335,13 +442,20 @@ void AudioSharingWidget::startSession(
           [this, peer, session, generation, failure] {
             if (generation != m_generation)
               return;
+            if (m_worker.joinable())
+              m_worker.join();
             m_running = false;
-            m_stop->setVisible(false);
+            const bool retry = !failure.isEmpty();
+            m_retryClock.start();
+            m_stop->setVisible(retry && bool(m_localOutputState));
             if (m_localPlayback)
               m_localPlayback->setVisible(false);
-            m_activePeer.clear();
-            m_session.clear();
-            m_control->send(peer, {{"type", "stop"}, {"session", session}});
+            if (!retry) {
+              m_localOutputState.reset();
+              m_activePeer.clear();
+              m_session.clear();
+            }
+            m_control->send(peer, {{"type", "stop"}, {"session", session}, {"retry", retry}});
             m_status->setText(
                 failure.isEmpty() ? QStringLiteral("音频已停止 · 键鼠保持连接")
                                   : QStringLiteral("%1 · 正在自动重试").arg(failure)
@@ -353,11 +467,12 @@ void AudioSharingWidget::startSession(
     });
   } catch (const std::exception &) {
     m_running = false;
-    m_activePeer.clear();
-    m_session.clear();
-    m_stop->setVisible(false);
+    m_retryClock.start();
+    m_stop->setVisible(bool(m_localOutputState));
     if (m_localPlayback)
       m_localPlayback->setVisible(false);
     m_status->setText(QStringLiteral("音频暂不可用，正在自动重试"));
+    m_control->send(peer, {{"type", "stop"}, {"session", session}, {"retry", true}});
+    QTimer::singleShot(2000, this, [this] { reconcile(); });
   }
 }

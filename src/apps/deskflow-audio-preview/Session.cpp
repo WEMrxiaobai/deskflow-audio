@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -29,6 +30,31 @@ namespace ae = deskflow::audio::engine;
 namespace aw = deskflow::audio::windows;
 namespace at = deskflow::audio::transport;
 using deskflow::audio::dsp::PcmFormat;
+namespace preview {
+struct LocalOutputState
+{
+  aw::MuteWatchdog watchdog;
+  std::wstring endpoint;
+  HRESULT prepare(const std::wstring &id, bool playLocally)
+  {
+    if (endpoint != id || !watchdog.running()) {
+      const auto stopped = watchdog.stop();
+      if (FAILED(stopped))
+        return stopped;
+      endpoint.clear();
+      const auto started = watchdog.start(id);
+      if (FAILED(started))
+        return started;
+      endpoint = id;
+    }
+    return watchdog.update(playLocally);
+  }
+};
+std::shared_ptr<LocalOutputState> createLocalOutputState()
+{
+  return std::make_shared<LocalOutputState>();
+}
+} // namespace preview
 namespace {
 void notify(
     const preview::SessionObserver &observer, preview::SessionState state, const std::string &message,
@@ -198,6 +224,13 @@ void runInternal(
     throw std::invalid_argument("testRender requires a receiving test session");
   if (testCapture && (!test || receive))
     throw std::invalid_argument("testCapture requires a sending test session");
+  if (options.sharedPlayback && (!receive || options.playbackSlot >= 2))
+    throw std::invalid_argument("Shared playback requires a receiving slot 0 or 1");
+  if (test && (!std::isfinite(options.testToneHz) || options.testToneHz < 0 || options.testToneHz >= 24000))
+    throw std::invalid_argument("Invalid synthetic test frequency");
+  if (test &&
+      (options.testDuration <= std::chrono::milliseconds::zero() || options.testDuration > std::chrono::minutes(10)))
+    throw std::invalid_argument("testDuration must be between 1 and 600000 milliseconds");
   if (options.handshakeTimeout <= std::chrono::milliseconds::zero() ||
       options.handshakeTimeout > std::chrono::minutes(1))
     throw std::invalid_argument("handshakeTimeout must be between 1 and 60000 milliseconds");
@@ -214,7 +247,7 @@ void runInternal(
   if (stopping.load())
     return;
   HANDLE exclusive = nullptr;
-  if (!test) {
+  if (!test && !options.sharedPlayback) {
     exclusive = CreateMutexW(nullptr, FALSE, L"Local\\DeskflowAudioPreviewActive");
     if (!exclusive || GetLastError() == ERROR_ALREADY_EXISTS) {
       if (exclusive)
@@ -296,6 +329,12 @@ void runInternal(
       preview::Nonce received{};
       if (preview::verifyControl(invite.value, std::span(packet.data(), bytes), type, received)) {
         if (receive && type == preview::ControlType::Hello) {
+          if (!options.expectedSenderAddress.empty()) {
+            IN_ADDR expected{};
+            if (InetPtonA(AF_INET, options.expectedSenderAddress.c_str(), &expected) != 1 ||
+                expected.s_addr != from.sin_addr.s_addr)
+              continue;
+          }
           peer = from;
           nonce = received;
           connected = true;
@@ -329,12 +368,17 @@ void runInternal(
     Network &network;
     sockaddr_in peer;
     std::vector<std::uint8_t> packet;
+    bool enabled;
     ~StopGuard()
     {
-      for (int i = 0; i < 3; ++i)
+      for (int i = 0; enabled && i < 3; ++i)
         (void)network.sendTo(packet, peer);
     }
-  } stopGuard{network, peer, preview::controlPacket(invite.value, preview::ControlType::Stop, nonce)};
+  } stopGuard{
+      network, peer, preview::controlPacket(invite.value, preview::ControlType::Stop, nonce),
+      !options.controlOwnsLifetime
+  };
+  const auto ack = preview::controlPacket(invite.value, preview::ControlType::Ack, nonce);
   auto session = preview::sessionMediaKey(invite.value, nonce);
   at::SrtpKey key(session);
   SecureZeroMemory(session.data(), session.size());
@@ -342,7 +386,19 @@ void runInternal(
   Device device;
   std::unique_ptr<ae::AudioSender> sender;
   std::unique_ptr<ae::AudioReceiver> receiver;
-  aw::MuteWatchdog localOutput;               // Outlives backend; restores after callbacks stop on every exit.
+  preview::LocalOutputState sessionOutput; // CLI restores on exit; GUI can retain ownership across retries.
+  auto &localOutput = options.localOutputState ? *options.localOutputState : sessionOutput;
+  struct PlaybackRegistration
+  {
+    std::shared_ptr<preview::SharedPlayback> output;
+    std::size_t slot;
+    bool attached = false;
+    ~PlaybackRegistration()
+    {
+      if (output && attached)
+        output->detach(slot);
+    }
+  } registration{options.sharedPlayback, options.playbackSlot};
   std::unique_ptr<aw::WasapiBackend> backend; // Stops callbacks before destroying engines.
   PcmFormat format{48000, 2};
   const bool useDevice = !test || testRender || testCapture;
@@ -350,7 +406,9 @@ void runInternal(
   std::wstring captureEndpoint;
   if (manageLocalOutput && FAILED(aw::WasapiBackend::defaultRenderEndpointId(captureEndpoint)))
     throw std::runtime_error("无法读取共享音频设备，本机静音未修改");
-  if (useDevice) {
+  if (options.sharedPlayback)
+    format = options.sharedPlayback->prepare();
+  else if (useDevice) {
     aw::Callbacks callbacks{&device, Device::capture, Device::render, Device::status};
     backend = std::make_unique<aw::WasapiBackend>(
         receive ? aw::Direction::Render : aw::Direction::LoopbackCapture, callbacks, captureEndpoint
@@ -370,6 +428,10 @@ void runInternal(
   if (receive) {
     receiver = std::make_unique<ae::AudioReceiver>(format, 5, config, std::move(key), ae::ReceiverOptions{.35f});
     device.receiver = receiver.get();
+    if (options.sharedPlayback) {
+      options.sharedPlayback->attach(options.playbackSlot, receiver.get());
+      registration.attached = true;
+    }
   } else {
     sender = std::make_unique<ae::AudioSender>(format, 5, config, std::move(key), [&](auto bytes) {
       return network.sendTo(bytes, peer);
@@ -378,11 +440,11 @@ void runInternal(
     device.sender = sender.get();
   }
   if (manageLocalOutput) {
-    if (FAILED(localOutput.start(captureEndpoint)) || FAILED(localOutput.update(options.localPlayback->load())))
-      throw std::runtime_error("无法安全控制本机播放，已停止共享并恢复本机声音");
+    if (FAILED(localOutput.prepare(captureEndpoint, options.localPlayback->load())))
+      throw std::runtime_error("无法安全控制本机播放，已暂停音频共享");
   }
   if (receive)
-    (void)network.sendTo(preview::controlPacket(invite.value, preview::ControlType::Ack, nonce), peer);
+    (void)network.sendTo(ack, peer);
   notify(
       observer, preview::SessionState::Connected,
       receive ? (test && !testRender ? "已连接：测试模式仅解码丢弃，不播放。"
@@ -395,17 +457,19 @@ void runInternal(
   std::uint64_t frame = 0;
   std::array<float, 480> tone{}, discard{};
   float decodedPeak = 0;
-  while (!stopping && preview::unixSeconds() < invite.value.expiresUnixSeconds) {
+  // Credential expiry limits NEW handshakes. An authenticated active stream
+  // remains owned by the paired control connection until stop/disconnect.
+  while (!stopping) {
     const auto now = ae::monotonicNowNs();
-    if (test && now - start >= 5000000000ULL)
+    if (test && now - start >= static_cast<std::uint64_t>(options.testDuration.count()) * 1000000ULL)
       break;
     if (manageLocalOutput && now >= nextLocalOutputCheck) {
       std::wstring currentEndpoint;
       if (FAILED(aw::WasapiBackend::defaultRenderEndpointId(currentEndpoint)) || currentEndpoint != captureEndpoint)
-        throw std::runtime_error("默认声卡已变化，正在恢复原设备并重新连接");
-      const auto outputResult = localOutput.update(options.localPlayback->load());
+        throw std::runtime_error("默认声卡已变化，正在重新连接");
+      const auto outputResult = localOutput.watchdog.update(options.localPlayback->load());
       if (FAILED(outputResult))
-        throw std::runtime_error("本机播放控制已中断，停止共享并恢复声音");
+        throw std::runtime_error("本机播放控制已中断，已暂停音频共享");
       if (outputResult == S_FALSE && !localOutputOverridden) {
         localOutputOverridden = true;
         notify(
@@ -423,7 +487,7 @@ void runInternal(
         continue;
       preview::ControlType type{};
       preview::Nonce received{};
-      if (preview::verifyControl(invite.value, std::span(packet.data(), bytes), type, received)) {
+      if (preview::verifyControl(invite.value, std::span(packet.data(), bytes), type, received, false)) {
         if (received != nonce)
           continue;
         if (type == preview::ControlType::Stop) {
@@ -431,34 +495,43 @@ void runInternal(
           break;
         }
         if (receive && type == preview::ControlType::Hello)
-          (void)network.sendTo(preview::controlPacket(invite.value, preview::ControlType::Ack, nonce), peer);
+          (void)network.sendTo(ack, peer);
       } else if (receive)
         (void)receiver->ingest(std::span(packet.data(), bytes), now);
     }
     if (test && !receive && !testCapture && now >= nextTone) {
       for (std::size_t i = 0; i < 240; ++i, ++frame)
-        tone[2 * i] = tone[2 * i + 1] = .01f * std::sin(float(frame % 48000) * 6.2831853f * 440 / 48000);
+        tone[2 * i] = tone[2 * i + 1] =
+            options.testToneHz == 0
+                ? .01f
+                : .01f * std::sin(float(frame % 48000) * 6.2831853f * float(options.testToneHz) / 48000);
       (void)sender->capture(tone, false, now);
       nextTone += 5000000;
       if (now > nextTone + 5000000)
         nextTone = now + 5000000;
     }
     if (receive) {
+      if (options.playbackControl) {
+        receiver->setVolume(options.playbackControl->volume.load());
+        receiver->setMuted(options.playbackControl->muted.load());
+      }
       receiver->tick(now);
-      if (test && !testRender && now >= nextRender) {
+      if (test && !testRender && !options.sharedPlayback && now >= nextRender) {
         (void)receiver->render(discard);
         for (float sample : discard)
           decodedPeak = std::max(decodedPeak, std::abs(sample));
         nextRender += 5000000;
       }
       if (receiver->stats().requiresReanchor)
-        throw std::runtime_error("音频中断超过恢复范围。请重新开启音频共享以建立新会话。");
+        throw std::runtime_error("音频中断超过恢复范围，需要重新建立会话");
       if (receiver->status().state == ae::EngineState::Failed)
         throw std::runtime_error("播放周期不支持：当前预览要求声卡回调不超过10ms。");
     } else if (sender->status().state == ae::EngineState::Failed)
       throw std::runtime_error("编码发送失败");
     if (useDevice && (device.failed || device.generation.load() != device.active.load()))
-      throw std::runtime_error("默认声卡变化或不可用。请重新启动预览。");
+      throw std::runtime_error("声卡变化或暂时不可用，需要重新建立会话");
+    if (options.sharedPlayback && !options.sharedPlayback->healthy())
+      throw std::runtime_error("收听设备变化或暂时不可用，需要重新建立会话");
     if (now >= nextReport) {
       std::ostringstream text;
       std::uint64_t packets = 0;
@@ -498,7 +571,7 @@ void runInternal(
   if (test) {
     if (testCapture && device.capturedCallbacks.load() < 100)
       throw std::runtime_error("真实系统声音测试未产生足够采集回调");
-    if (testRender && device.renderedCallbacks.load() < 100)
+    if (testRender && !options.sharedPlayback && device.renderedCallbacks.load() < 100)
       throw std::runtime_error("真实声卡测试未产生足够播放回调");
     if (receive && receiver->stats().decodedPackets < 600)
       throw std::runtime_error("双进程测试解码数量不足");
@@ -508,6 +581,156 @@ void runInternal(
 }
 } // namespace
 namespace preview {
+struct SharedPlayback::Impl
+{
+  const bool test, testRender;
+  std::mutex setup;
+  Device device;
+  std::array<std::atomic<ae::AudioReceiver *>, 2> sources{};
+  std::atomic<unsigned> readers{0};
+  std::atomic<bool> stopping{false};
+  std::atomic<std::uint64_t> callbacks{0};
+  std::atomic<std::uint64_t> twoSource{0};
+  std::atomic<float> maximum{0};
+  std::unique_ptr<aw::WasapiBackend> backend;
+  std::thread synthetic;
+  HANDLE exclusive = nullptr;
+  PcmFormat format{48000, 2};
+  bool prepared = false;
+  Impl(bool testing, bool render) : test(testing), testRender(render)
+  {
+  }
+  ~Impl()
+  {
+    stopping = true;
+    backend.reset();
+    if (synthetic.joinable())
+      synthetic.join();
+    if (exclusive)
+      CloseHandle(exclusive);
+  }
+  static void status(void *context, const aw::Status &value) noexcept
+  {
+    Device::status(&static_cast<Impl *>(context)->device, value);
+  }
+  static void render(void *context, std::span<float> output, const aw::DeviceFormat &format) noexcept
+  {
+    auto &self = *static_cast<Impl *>(context);
+    self.readers.fetch_add(1);
+    std::array<ae::AudioReceiver *, 2> active{};
+    std::size_t count = 0;
+    if (format.generation == self.device.active.load()) {
+      for (auto &source : self.sources)
+        if (auto *receiver = source.load())
+          active[count++] = receiver;
+    }
+    (void)ae::AudioReceiver::mix(std::span<ae::AudioReceiver *const>(active.data(), count), output);
+    self.readers.fetch_sub(1);
+    float peak = self.maximum.load(std::memory_order_relaxed);
+    for (auto sample : output)
+      peak = std::max(peak, std::abs(sample));
+    self.maximum.store(peak, std::memory_order_relaxed);
+    self.callbacks.fetch_add(1, std::memory_order_relaxed);
+    if (count == 2)
+      self.twoSource.fetch_add(1, std::memory_order_relaxed);
+  }
+  bool healthy() const noexcept
+  {
+    return !device.failed.load() && device.generation.load() == device.active.load();
+  }
+};
+SharedPlayback::SharedPlayback(bool test, bool testRender) : d(std::make_unique<Impl>(test, testRender))
+{
+}
+SharedPlayback::~SharedPlayback() = default;
+PcmFormat SharedPlayback::prepare()
+{
+  std::lock_guard lock(d->setup);
+  if (d->prepared && d->healthy())
+    return d->format;
+  for (auto &source : d->sources)
+    if (source.load())
+      throw std::runtime_error("正在等待音频来源释放旧播放设备");
+  d->backend.reset();
+  d->prepared = false;
+  d->device.failed = false;
+  d->device.generation = 0;
+  d->device.active = 0;
+  if (!d->test && !d->exclusive) {
+    const auto handle = CreateMutexW(nullptr, FALSE, L"Local\\DeskflowAudioPreviewActive");
+    if (!handle || GetLastError() == ERROR_ALREADY_EXISTS) {
+      if (handle)
+        CloseHandle(handle);
+      throw std::runtime_error("本Windows会话已经运行另一音频共享");
+    }
+    d->exclusive = handle;
+  }
+  if (!d->test || d->testRender) {
+    aw::Callbacks callbacks{d.get(), nullptr, Impl::render, Impl::status};
+    d->backend = std::make_unique<aw::WasapiBackend>(aw::Direction::Render, callbacks);
+    if (!d->backend->start())
+      throw std::runtime_error("无法启动收听设备");
+    const auto until = ae::monotonicNowNs() + 5000000000ULL;
+    while (!d->device.generation && !d->device.failed && ae::monotonicNowNs() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!d->device.generation)
+      throw std::runtime_error("5秒内未打开收听设备");
+    d->format = {d->device.rate.load(), d->device.channels.load()};
+    d->device.active = d->device.generation.load();
+  } else if (!d->synthetic.joinable()) {
+    d->device.generation = 1;
+    d->device.active = 1;
+    d->synthetic = std::thread([impl = d.get()] {
+      std::array<float, 480> output{};
+      aw::DeviceFormat format{48000, 2, 0, 240, 1};
+      aw::WorkerTimer timer;
+      auto next = ae::monotonicNowNs();
+      while (!impl->stopping) {
+        const auto now = ae::monotonicNowNs();
+        if (now >= next) {
+          Impl::render(impl, output, format);
+          next = now + 5000000ULL;
+        }
+        timer.waitMicroseconds(500);
+      }
+    });
+  }
+  d->prepared = true;
+  return d->format;
+}
+void SharedPlayback::attach(std::size_t slot, ae::AudioReceiver *receiver)
+{
+  std::lock_guard lock(d->setup);
+  if (slot >= d->sources.size() || !receiver || d->sources[slot].load() || receiver->outputFormat() != d->format)
+    throw std::invalid_argument("Invalid or occupied shared playback slot");
+  d->sources[slot].store(receiver);
+}
+void SharedPlayback::detach(std::size_t slot) noexcept
+{
+  if (slot >= d->sources.size())
+    return;
+  // Seq-cst publication + reader entry ensures every callback holding the old
+  // pointer finishes before its source worker destroys that receiver.
+  d->sources[slot].store(nullptr);
+  while (d->readers.load() != 0)
+    std::this_thread::yield();
+}
+bool SharedPlayback::healthy() const noexcept
+{
+  return d->healthy();
+}
+std::uint64_t SharedPlayback::renderedCallbacks() const noexcept
+{
+  return d->callbacks.load();
+}
+std::uint64_t SharedPlayback::twoSourceCallbacks() const noexcept
+{
+  return d->twoSource.load();
+}
+float SharedPlayback::peak() const noexcept
+{
+  return d->maximum.load();
+}
 void runSession(const SessionOptions &options, std::atomic<bool> &stop, const SessionObserver &observer)
 {
   try {

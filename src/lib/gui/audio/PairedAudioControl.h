@@ -39,6 +39,7 @@ public:
   void send(const QString &id, const QJsonObject &message);
   QStringList peerIds() const;
   QString peerAddress(const QString &id) const;
+  QString localAddress(const QString &id) const;
   bool isServer() const;
 
 Q_SIGNALS:

@@ -207,6 +207,11 @@ struct Stream final
   ComPtr<IAudioClient> client;
   ComPtr<IAudioCaptureClient> capture;
   ComPtr<IAudioRenderClient> render;
+  // Keep the shared audio engine ticking when every application is idle.
+  // WASAPI loopback otherwise stops delivering PCM, breaking the media timeline.
+  ComPtr<IAudioClient> idleClient;
+  ComPtr<IAudioRenderClient> idleRender;
+  UINT32 idleBufferFrames = 0;
   Event ready;
   detail::PcmLayout layout;
   DeviceFormat format;
@@ -214,6 +219,7 @@ struct Stream final
   DWORD pollMs = 5;
   bool eventDriven = false;
   bool started = false;
+  bool idleStarted = false;
 
   ~Stream()
   {
@@ -222,6 +228,8 @@ struct Stream final
     // Close ready only after all services/client/device references are gone.
     capture.Reset();
     render.Reset();
+    idleRender.Reset();
+    idleClient.Reset();
     client.Reset();
     device.Reset();
   }
@@ -230,6 +238,10 @@ struct Stream final
     if (started) {
       client->Stop();
       started = false;
+    }
+    if (idleStarted) {
+      idleClient->Stop();
+      idleStarted = false;
     }
   }
 
@@ -320,14 +332,46 @@ struct Stream final
     scratch.resize(samples);
     const auto halfBufferMs = static_cast<std::uint64_t>(format.bufferFrames) * 500 / format.sampleRate;
     pollMs = static_cast<DWORD>(std::clamp<std::uint64_t>(halfBufferMs, 1, 10));
-    if (direction == Direction::LoopbackCapture)
-      return client->GetService(IID_PPV_ARGS(&capture));
+    if (direction == Direction::LoopbackCapture) {
+      if (FAILED(hr = client->GetService(IID_PPV_ARGS(&capture))))
+        return hr;
+      // Same IMMDevice and mix format as capture; SILENT buffers add no audible
+      // content and never change endpoint volume or the user's default device.
+      if (FAILED(
+              hr = device->Activate(
+                  __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(idleClient.GetAddressOf())
+              )
+          ))
+        return hr;
+      if (FAILED(hr = idleClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 300000, 0, raw, nullptr)) ||
+          FAILED(hr = idleClient->GetBufferSize(&idleBufferFrames)) ||
+          FAILED(hr = idleClient->GetService(IID_PPV_ARGS(&idleRender))))
+        return hr;
+      return sustainIdleCapture();
+    }
     if (FAILED(hr = client->GetService(IID_PPV_ARGS(&render))))
       return hr;
     BYTE *data = nullptr;
     if (FAILED(hr = render->GetBuffer(format.bufferFrames, &data)))
       return hr;
     return render->ReleaseBuffer(format.bufferFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+  }
+
+  HRESULT sustainIdleCapture() noexcept
+  {
+    UINT32 padding = 0;
+    HRESULT hr = idleClient->GetCurrentPadding(&padding);
+    if (FAILED(hr))
+      return hr;
+    if (padding > idleBufferFrames)
+      return AUDCLNT_E_BUFFER_SIZE_ERROR;
+    const auto frames = idleBufferFrames - padding;
+    if (!frames)
+      return S_OK;
+    BYTE *data = nullptr;
+    if (FAILED(hr = idleRender->GetBuffer(frames, &data)))
+      return hr;
+    return idleRender->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT);
   }
 
   HRESULT capturePackets(const Callbacks &callbacks, HANDLE stopEvent, HANDLE restartEvent) noexcept
@@ -403,7 +447,14 @@ struct Stream final
   // logging, COM activation, notification registration, or endpoint queries.
   HRESULT run(const Callbacks &callbacks, HANDLE stopEvent, HANDLE restartEvent) noexcept
   {
-    HRESULT hr = client->Start();
+    HRESULT hr = S_OK;
+    if (idleClient) {
+      hr = idleClient->Start();
+      if (FAILED(hr))
+        return hr;
+      idleStarted = true;
+    }
+    hr = client->Start();
     if (FAILED(hr))
       return hr;
     started = true;
@@ -418,6 +469,8 @@ struct Stream final
         return HRESULT_FROM_WIN32(GetLastError());
       if (result != WAIT_TIMEOUT && result != WAIT_OBJECT_0 + 2)
         return E_UNEXPECTED;
+      if (capture && FAILED(hr = sustainIdleCapture()))
+        return hr;
       hr = capture ? capturePackets(callbacks, stopEvent, restartEvent) : renderAvailable(callbacks);
       if (FAILED(hr))
         return hr;

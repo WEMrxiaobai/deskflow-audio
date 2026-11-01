@@ -119,6 +119,11 @@ add_library(${target} STATIC
 
 if(WIN32 AND ENABLE_AUDIO_SHARING)
   target_sources(${target} PRIVATE widgets/AudioSharingWidget.cpp widgets/AudioSharingWidget.h audio/PairedAudioControl.cpp audio/PairedAudioControl.h)
+  target_sources(${target} PRIVATE audio/PairedAudioGroup.cpp audio/PairedAudioGroup.h)
+  add_executable(deskflow-paired-audio-group-tests EXCLUDE_FROM_ALL ../audio/tests/PairedAudioGroupTests.cpp ../audio/tests/GroupSessionFixture.cpp)
+  target_compile_definitions(deskflow-paired-audio-group-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+  target_compile_options(deskflow-paired-audio-group-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-paired-audio-group-tests PRIVATE gui)
   target_compile_definitions(${target} PRIVATE DESKFLOW_AUDIO_SHARING=1)
   target_compile_options(${target} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
   target_link_libraries(${target} PUBLIC deskflow-audio-session)

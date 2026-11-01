@@ -4,7 +4,8 @@
  */
 // EXPLICIT device integration test: renders a quiet .01 tone, captures system
 // loopback through the REAL widget sender, and decodes/discards remotely. Never
-// opens a microphone. Temporarily mutes/unmutes only an initially-unmuted output.
+// opens a microphone. Preserves an initially-muted output; otherwise verifies
+// temporary mute/unmute. Counts only this test process's watchdog children.
 #include "Session.h"
 #include "audio/windows/WasapiBackend.h"
 #include "common/Constants.h"
@@ -40,6 +41,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <windows.h>
+#include <tlhelp32.h>
+
+void failSenderWidgetReceive();
 
 namespace {
 using deskflow::audio::windows::WasapiBackend;
@@ -84,6 +89,20 @@ bool muteIs(bool expected)
   float volume = 0; bool muted = false;
   return WasapiBackend::readDefaultMasterVolume(volume, muted) >= 0 && muted == expected;
 }
+unsigned watchdogChildren()
+{
+  const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  check(snapshot != INVALID_HANDLE_VALUE, "Cannot inspect isolated watchdog lifetime");
+  PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+  unsigned count = 0;
+  if (Process32FirstW(snapshot, &entry)) do {
+    if (entry.th32ParentProcessID == GetCurrentProcessId() &&
+        _wcsicmp(entry.szExeFile, L"deskflow-audio-mute-watchdog.exe") == 0)
+      ++count;
+  } while (Process32NextW(snapshot, &entry));
+  CloseHandle(snapshot);
+  return count;
+}
 struct Tone
 {
   double phase = 0;
@@ -120,6 +139,8 @@ struct Receiver
   void join() { stop = true; if (worker.joinable()) worker.join(); }
   void start(preview::SessionOptions options)
   {
+    join();
+    stop = false; done = false; succeeded = false; connected = false; packets = 0; peak = 0;
     worker = std::thread([this, options = std::move(options)] {
       try {
         preview::runSession(options, stop, [this](const preview::SessionEvent &event) {
@@ -150,7 +171,7 @@ public:
     return false;
   }
 };
-void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop)
+void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop, bool originallyMuted)
 {
   const auto serverPem = temporary.filePath(QStringLiteral("server.pem"));
   const auto clientPem = temporary.filePath(QStringLiteral("client.pem"));
@@ -174,7 +195,7 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop
   DialogWatch dialogs;
   app.installEventFilter(&dialogs);
   QString peer;
-  const auto session = QUuid::createUuid().toString(QUuid::Id128);
+  auto session = QUuid::createUuid().toString(QUuid::Id128);
   int disconnected = 0, stopMessages = 0;
   struct Cleanup
   {
@@ -218,7 +239,7 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop
                    [&](const QString &id, const QString &) {
     peer = id;
     remote.send(id, {{"type", "state"}, {"listen", true}, {"available", true}});
-    preview::SessionOptions options; options.receive = true; options.test = true;
+    preview::SessionOptions options; options.receive = true; options.test = true; options.controlOwnsLifetime = true;
     options.onReady = [&, id](const preview::Invitation &offer) {
       const auto payload = offerJson(offer);
       QMetaObject::invokeMethod(&callbacks, [&, id, payload] {
@@ -242,23 +263,67 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop
   if (!remoteStop) {
     check(widget.grab().save(QApplication::applicationDirPath() + QStringLiteral("/widget_sender.png")),
           "Cannot save sender widget evidence");
-    const auto initiallyReceived = receiver.packets.load();
-    local->setChecked(true);
-    check(waitFor([&] { return muteIs(false); }, 1500), "Checkbox did not safely restore local output");
-    check(waitFor([&] { return receiver.packets > initiallyReceived + 50; }, 1500), "SRTP stalled during local playback");
-    local->setChecked(false);
-    check(waitFor([&] { return muteIs(true); }, 1500), "Checkbox did not reacquire local mute");
+    if (!originallyMuted) {
+      const auto initiallyReceived = receiver.packets.load();
+      local->setChecked(true);
+      check(waitFor([&] { return muteIs(false); }, 1500), "Checkbox did not safely restore local output");
+      check(waitFor([&] { return receiver.packets > initiallyReceived + 50; }, 1500), "SRTP stalled during local playback");
+      local->setChecked(false);
+      check(waitFor([&] { return muteIs(true); }, 1500), "Checkbox did not reacquire local mute");
+    }
+    failSenderWidgetReceive(); // Real worker exception, isolated to the fixture's sender recvfrom.
+    check(waitFor([&] { return local->isHidden() && stop->isVisible(); }, 1500),
+          "Retry did not leave a usable stop control");
+    receiver.join();
+    QElapsedTimer retryGap; retryGap.start();
+    while (retryGap.elapsed() < 2300) {
+      QApplication::processEvents();
+      check(muteIs(true), "Sender became audible while waiting for retry");
+      check(watchdogChildren() == 1, "Retry destroyed the native mute owner");
+      QThread::msleep(20);
+    }
+    session = QUuid::createUuid().toString(QUuid::Id128);
+    preview::SessionOptions resumed; resumed.receive = true; resumed.test = true; resumed.controlOwnsLifetime = true;
+    resumed.onReady = [&](const preview::Invitation &offer) {
+      const auto payload = offerJson(offer);
+      QMetaObject::invokeMethod(&callbacks, [&, payload] {
+        remote.send(peer, {{"type", "offer"}, {"session", session}, {"offer", payload}});
+      }, Qt::QueuedConnection);
+    };
+    receiver.start(std::move(resumed));
+    check(waitFor([&] { return receiver.connected && local->isVisible(); }, 12000) && muteIs(true),
+          "Sender did not reconnect without releasing mute");
   }
   // Second session remains muted throughout: its decoded peak specifically
   // proves endpoint mute does not silence WASAPI loopback capture.
   check(waitFor([&] { return receiver.done.load(); }, 7000), "Remote decode did not finish");
   check(receiver.succeeded && receiver.packets >= 600 && receiver.peak > 0,
         "Actual widget capture/SRTP did not decode non-silent audio");
+  const auto verifiedPackets = receiver.packets.load();
+  const auto verifiedPeak = receiver.peak.load();
   if (remoteStop)
     remote.send(peer, {{"type", "state"}, {"listen", false}, {"available", true}});
-  else
+  else {
+    // Also exercise a fresh offer arriving before its old sender sees STOP.
+    // A ready sender must supersede the stale session rather than ignore it.
+    session = QUuid::createUuid().toString(QUuid::Id128);
+    preview::SessionOptions replacement; replacement.receive = true; replacement.test = true;
+    replacement.controlOwnsLifetime = true;
+    replacement.onReady = [&](const preview::Invitation &offer) {
+      const auto payload = offerJson(offer);
+      QMetaObject::invokeMethod(&callbacks, [&, payload] {
+        remote.send(peer, {{"type", "offer"}, {"session", session}, {"offer", payload}});
+      }, Qt::QueuedConnection);
+    };
+    receiver.start(std::move(replacement));
+    check(waitFor([&] { return receiver.connected.load(); }, 12000) && muteIs(true),
+          "Fresh trusted offer was ignored while an old sender was active");
+    remote.send(peer, {{"type", "stop"}, {"session", session}, {"retry", true}});
+    check(waitFor([&] { return local->isHidden() && stop->isVisible(); }, 1500) && muteIs(true),
+          "Remote retry released the sender mute");
     stop->click();
-  check(waitFor([&] { return muteIs(false) && stop->isHidden() && local->isHidden(); }, 2000),
+  }
+  check(waitFor([&] { return muteIs(originallyMuted) && stop->isHidden() && local->isHidden() && watchdogChildren() == 0; }, 2000),
         "Stop did not restore original mute and hide sender controls");
   check(waitFor([&] { return stopMessages > 0; }, 1000), "Session stop was not advertised");
   check(disconnected == 0 && control->peerIds().size() == 1 && remote.peerIds().size() == 1,
@@ -266,9 +331,11 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop
   check(!dialogs.seen && !QApplication::activeModalWidget(), "Unexpected audio authorization dialog");
   check(contents(clientsDb) == clientsBefore && contents(serversDb) == serversBefore &&
         QDir(temporary.path()).entryList(QDir::Files) == filesBefore, "Pairing/files changed");
-  std::cout << "actual_sender=1 default_mute=1 checkbox_restore_remute=" << (!remoteStop)
-            << " entire_session_muted=" << remoteStop << " decoded=" << receiver.packets.load()
-            << " decoded_peak=" << receiver.peak.load() << " stop_source=" << (remoteStop ? "remote_state" : "button")
+  std::cout << "actual_sender=1 default_mute=1 checkbox_restore_remute=" << (!remoteStop && !originallyMuted)
+            << " entire_session_muted=" << remoteStop << " decoded=" << verifiedPackets
+            << " decoded_peak=" << verifiedPeak << " stop_source=" << (remoteStop ? "remote_state" : "button")
+            << " worker_failure_retry=" << !remoteStop << " remote_retry=" << !remoteStop
+            << " fresh_offer_replaces_sender=" << !remoteStop
             << " original_mute_restored=1 tls_survives=1 dialogs=0 invitation_files=0\n";
 }
 } // namespace
@@ -280,8 +347,8 @@ int main(int argc, char **argv)
   QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
   QApplication app(argc, argv);
   float originalVolume = 0; bool originalMute = false;
-  if (WasapiBackend::readDefaultMasterVolume(originalVolume, originalMute) < 0 || originalMute) {
-    std::cout << "SKIP: requires an available originally-unmuted endpoint; will not unmute user audio.\n";
+  if (WasapiBackend::readDefaultMasterVolume(originalVolume, originalMute) < 0) {
+    std::cout << "SKIP: requires an available endpoint.\n";
     return 77;
   }
   QTemporaryDir temporary;
@@ -317,8 +384,8 @@ int main(int argc, char **argv)
     WasapiBackend source(deskflow::audio::windows::Direction::Render, callbacks);
     check(source.start(), "Cannot start isolated quiet system source");
     check(waitFor([&] { return tone.running && tone.callbacks > 5; }, 5000), "Quiet source did not open");
-    exercise(app, temporary, false);
-    exercise(app, temporary, true);
+    exercise(app, temporary, false, originalMute);
+    exercise(app, temporary, true, originalMute);
     source.stop();
     float finalVolume = 0; bool finalMute = true;
     check(WasapiBackend::readDefaultMasterVolume(finalVolume, finalMute) >= 0 && finalMute == originalMute &&
