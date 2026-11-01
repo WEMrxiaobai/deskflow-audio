@@ -66,6 +66,13 @@ FingerprintDialog::FingerprintDialog(
       m_lblFooter->setText(tr("\nDo you want to connect to the server?\n"));
     }
 
+#if defined(Q_OS_WIN) && defined(DESKFLOW_AUDIO_SHARING)
+    m_lblFooter->setText(
+        m_lblFooter->text() +
+        QStringLiteral("\n配对后可共享键鼠和系统声音，无需再次配对。\n在收听电脑打开音频开关后，对方自动发送声音。")
+    );
+    m_lblFooter->setWordWrap(true);
+#endif
     m_buttonBox->addButton(QDialogButtonBox::Yes);
     m_buttonBox->addButton(QDialogButtonBox::No);
     m_buttonBox->button(QDialogButtonBox::No)->setFocus();

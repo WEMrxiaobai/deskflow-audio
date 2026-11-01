@@ -117,6 +117,32 @@ add_library(${target} STATIC
   widgets/SettingsDialogButtonBox.h
 )
 
+if(WIN32 AND ENABLE_AUDIO_SHARING)
+  target_sources(${target} PRIVATE widgets/AudioSharingWidget.cpp widgets/AudioSharingWidget.h audio/PairedAudioControl.cpp audio/PairedAudioControl.h)
+  target_compile_definitions(${target} PRIVATE DESKFLOW_AUDIO_SHARING=1)
+  target_compile_options(${target} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(${target} PUBLIC deskflow-audio-session)
+  add_executable(deskflow-audio-gui-tests EXCLUDE_FROM_ALL ../audio/tests/GuiIntegrationTests.cpp)
+  target_compile_options(deskflow-audio-gui-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-audio-gui-tests PRIVATE gui)
+  add_executable(deskflow-paired-audio-control-tests EXCLUDE_FROM_ALL ../audio/tests/PairedAudioControlTests.cpp)
+  target_compile_options(deskflow-paired-audio-control-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-paired-audio-control-tests PRIVATE gui)
+  add_executable(deskflow-paired-audio-media-tests EXCLUDE_FROM_ALL ../audio/tests/PairedAudioMediaTests.cpp)
+  target_compile_options(deskflow-paired-audio-media-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-paired-audio-media-tests PRIVATE gui)
+  add_executable(deskflow-paired-audio-widget-tests EXCLUDE_FROM_ALL ../audio/tests/PairedAudioWidgetTests.cpp)
+  target_compile_options(deskflow-paired-audio-widget-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-paired-audio-widget-tests PRIVATE gui)
+  add_executable(deskflow-paired-audio-sender-widget-tests EXCLUDE_FROM_ALL ../audio/tests/PairedAudioSenderWidgetTests.cpp ../audio/tests/SenderWidgetSessionFixture.cpp)
+  target_compile_definitions(deskflow-paired-audio-sender-widget-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+  target_compile_options(deskflow-paired-audio-sender-widget-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-paired-audio-sender-widget-tests PRIVATE gui)
+  add_executable(deskflow-mainwindow-audio-tests EXCLUDE_FROM_ALL ../audio/tests/MainWindowIntegrationTests.cpp ../../apps/res/deskflow.qrc)
+  target_compile_options(deskflow-mainwindow-audio-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-mainwindow-audio-tests PRIVATE gui)
+endif()
+
 target_link_libraries(${target}
   PUBLIC
     common

@@ -85,6 +85,8 @@ public:
     inline static const auto ShownServerFirstStartMessage = QStringLiteral("gui/shownServerFirstStartMessage");
     inline static const auto ShowVersionInTitle = QStringLiteral("gui/showVersionInTitle");
     inline static const auto IgnoreMissingKeyboardLayouts = QStringLiteral("gui/ignoreMissingKeyboardLayouts");
+    inline static const auto AudioListen = QStringLiteral("gui/audioListen");
+    inline static const auto AudioLocalPlayback = QStringLiteral("gui/audioLocalPlayback");
   };
   struct Log
   {
@@ -314,6 +316,8 @@ private:
     , Gui::ShownServerFirstStartMessage
     , Gui::ShowVersionInTitle
     , Gui::IgnoreMissingKeyboardLayouts
+    , Gui::AudioListen
+    , Gui::AudioLocalPlayback
     , Security::Certificate
     , Security::CheckPeers
     , Security::KeySize
@@ -345,6 +349,8 @@ private:
     , Gui::ShownServerFirstStartMessage
     , Gui::ShowVersionInTitle
     , Gui::IgnoreMissingKeyboardLayouts
+    , Gui::AudioListen
+    , Gui::AudioLocalPlayback
     , Core::PreventSleep
     , Core::EnableEnterCommand
     , Core::EnableExitCommand

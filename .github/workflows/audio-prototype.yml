@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: (C) 2026 Deskflow Developers
+# SPDX-License-Identifier: MIT
+name: Audio prototype
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/lib/audio/**'
+      - 'src/apps/deskflow-audio/**'
+      - 'tools/audio/**'
+      - '.github/workflows/audio-prototype.yml'
+permissions:
+  contents: read
+jobs:
+  windows-audio:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure pinned audio dependencies without Qt
+        run: cmake -S src/lib/audio -B build/audio -A x64 -DDESKFLOW_AUDIO_FETCH_DEPENDENCIES=ON
+      - name: Build release
+        run: cmake --build build/audio --config Release --parallel 4
+      - name: Test without capturing or playing device audio
+        run: ctest --test-dir build/audio -C Release --output-on-failure
+      - name: Test encrypted localhost media
+        run: |
+          build/audio/Release/deskflow-audio-probe.exe --self-test 3 5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          build/audio/Release/deskflow-audio-probe.exe --self-test 3 10
+      - name: Verify virtual playback phase and joint engine clocks (no devices)
+        run: |
+          build/audio/Release/deskflow-audio-playback-phase.exe > build/audio/playback-phase.csv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          build/audio/Release/deskflow-audio-engine-clock.exe > build/audio/engine-clock.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Measure offline serial processing (not a realtime gate)
+        run: build/audio/Release/deskflow-audio-bench.exe 2000 > build/audio/benchmark-release.json
+      - name: Upload processing measurement
+        uses: actions/upload-artifact@v7
+        with:
+          name: audio-processing-measurement
+          path: |
+            build/audio/benchmark-release.json
+            build/audio/playback-phase.csv
+            build/audio/engine-clock.txt
+      - name: Build debug with matching dependency runtime
+        run: cmake --build build/audio --config Debug --parallel 4
+      - name: Test debug
+        run: ctest --test-dir build/audio -C Debug --output-on-failure
+  latency-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy==2.3.5
+      - run: python -B -m unittest discover -s tools/audio -p test_analyze_latency.py -v

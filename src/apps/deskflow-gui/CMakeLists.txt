@@ -57,6 +57,9 @@ install(
 )
 
 if(WIN32)
+  # Theme resources are SVG; make deployment retain the SVG plugin/module.
+  find_package(Qt6 ${REQUIRED_QT_VERSION} REQUIRED COMPONENTS Svg)
+  target_link_libraries(${target} Qt6::Svg)
   set_target_properties(${target} PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")
 
   install(RUNTIME_DEPENDENCY_SET guiDeps
@@ -68,9 +71,13 @@ if(WIN32)
 
   set(QT_DEPENDS_DIR ${CMAKE_BINARY_DIR}/qt-depends)
 
+  if(ENABLE_AUDIO_SHARING)
+    set(AUDIO_DEPLOY_TLS --force-openssl)
+  endif()
   add_custom_command(
     TARGET ${target} POST_BUILD
     COMMAND ${DEPLOYQT}
+      ${AUDIO_DEPLOY_TLS}
       --no-compiler-runtime
       --no-system-d3d-compiler
       --no-opengl-sw

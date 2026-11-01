@@ -34,6 +34,9 @@ elseif(WIN32)
   option (VCPKG_QT "Use Qt from VCPKG" OFF)
 endif()
 
+# Audio is an explicit developer opt-in until the P1 hardware/security gate passes.
+option(ENABLE_AUDIO_SHARING "Build experimental isolated Windows audio prototype" OFF)
+
 # Set CXX Requirements
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)

@@ -59,7 +59,7 @@ public:
   };
 
 public:
-  explicit MainWindow();
+  explicit MainWindow(const QString &guiSocketName = QStringLiteral("deskflow-gui"));
   ~MainWindow() override;
 
   [[nodiscard]] CoreMode coreMode() const
@@ -163,7 +163,7 @@ private:
 
   void serverClientsChanged(const QStringList &clients);
 
-  inline static const auto m_guiSocketName = QStringLiteral("deskflow-gui");
+  const QString m_guiSocketName;
   inline static const auto m_nameRegEx = QRegularExpression(QStringLiteral("^[\\w\\-_\\.]{0,255}$"));
 
   VersionChecker m_versionChecker;

@@ -31,6 +31,10 @@
 #include "gui/widgets/LogDock.h"
 #include "net/FingerprintDatabase.h"
 #include "widgets/StatusBar.h"
+#if defined(Q_OS_WIN) && defined(DESKFLOW_AUDIO_SHARING)
+#include "widgets/AudioSharingWidget.h"
+#include <QVBoxLayout>
+#endif
 
 #include <QCheckBox>
 #include <QCloseEvent>
@@ -57,8 +61,9 @@
 
 using namespace deskflow::gui;
 
-MainWindow::MainWindow()
+MainWindow::MainWindow(const QString &guiSocketName)
     : ui{std::make_unique<Ui::MainWindow>()},
+      m_guiSocketName(guiSocketName),
       m_coreProcess(m_serverConfig),
       m_trayIcon{new QSystemTrayIcon(this)},
       m_guiDupeChecker{new QLocalServer(this)},
@@ -82,6 +87,13 @@ MainWindow::MainWindow()
       m_networkMonitor{new NetworkMonitor(this)}
 {
   ui->setupUi(this);
+#if defined(Q_OS_WIN) && defined(DESKFLOW_AUDIO_SHARING)
+  if (auto *layout = qobject_cast<QVBoxLayout *>(ui->topLevelWidget->layout())) {
+    auto *audio = new AudioSharingWidget(ui->topLevelWidget);
+    layout->addWidget(audio);
+    audio->attach(&m_coreProcess);
+  }
+#endif
 
   setWindowIcon(QIcon::fromTheme(kRevFqdnName));
 
@@ -184,6 +196,11 @@ void MainWindow::restoreWindow()
   } else {
     setGeometry(windowGeometry);
   }
+#if defined(Q_OS_WIN) && defined(DESKFLOW_AUDIO_SHARING)
+  // Expand an old compact saved window before fixing its collapsed dimensions.
+  resize(size().expandedTo(minimumSizeHint()));
+  windowGeometry = geometry();
+#endif
   m_expandedSize = geometry().size();
 
   if (!totalGeometry.contains(windowGeometry)) {
