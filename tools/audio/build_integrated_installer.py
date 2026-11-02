@@ -27,7 +27,7 @@ WIX = "http://schemas.microsoft.com/wix/2006/wi"
 UTIL = "http://schemas.microsoft.com/wix/UtilExtension"
 FIREWALL = "http://schemas.microsoft.com/wix/FirewallExtension"
 UPGRADE_CODE = "027D1C8A-E7A5-4754-BB93-B2D45BFDBDC8"
-VERSION = "1.27.6"  # Three-computer routing, shared two-source playback and persistent source controls.
+VERSION = "1.27.7"  # Same audio features, with a reviewed minimal runtime distribution.
 for prefix, namespace in [("", WIX), ("util", UTIL), ("firewall", FIREWALL)]:
     ET.register_namespace(prefix, namespace)
 

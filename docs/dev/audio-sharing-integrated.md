@@ -51,7 +51,7 @@
 
 ## 安装
 
-完整版保留原GUI/core/daemon、Qt/SVG/TLS插件、翻译、文档、VC runtime及对应源码。MSI版本1.27.6升级此前开发包；这是音频开发构建，不是Deskflow官方1.27.6发行。对应源码作为同名Sources.zip单独提供。
+完整版保留原GUI/core/daemon、Qt/SVG/TLS插件、应用支持的语言、文档、所需VC runtime及对应源码。MSI版本1.27.7升级此前开发包；这是音频开发构建，不是Deskflow官方1.27.7发行。对应源码作为同名Sources.zip单独提供。打包前可用[精简stage脚本](../../tools/audio/prepare_minimal_stage.py)按当前二进制的导入关系选取VC运行库，并移除应用不提供的语言对应的Qt翻译；Qt动态插件予以保留。
 
 安装会使用原升级家族并配置/重启原服务，请保存工作并主动退出旧Deskflow；需要管理员权限。仅添加Private/localSubnet防火墙：原core TCP24800、GUI控制TCP24801、GUI媒体UDP，用户无需配置这些参数。不在Public网络自动开放。
 
