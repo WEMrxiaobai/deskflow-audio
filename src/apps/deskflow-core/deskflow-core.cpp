@@ -12,6 +12,7 @@
 #include "base/EventQueue.h"
 #include "base/Log.h"
 #include "common/Constants.h"
+#include "common/CoreRuntimeIdentity.h"
 #include "common/ExitCodes.h"
 #include "deskflow/ClientApp.h"
 #include "deskflow/ServerApp.h"
@@ -23,6 +24,7 @@
 
 #include <QApplication>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QSharedMemory>
 #include <QTextStream>
 #include <QThread>
@@ -126,6 +128,10 @@ int main(int argc, char **argv)
       ipcServer, &deskflow::core::ipc::IpcServer::stopProcessRequested, coreApp, &App::quit, Qt::DirectConnection
   );
   ipcServer->listen();
+  if (parser.clientMode()) {
+    const auto identity = QJsonDocument(coreRuntimeIdentity(false)).toJson(QJsonDocument::Compact).toBase64();
+    ipcServer->broadcastCommand(QStringLiteral("coreIdentity"), QString::fromLatin1(identity));
+  }
 
   QThread coreThread;
   QObject::connect(&coreThread, &QThread::finished, &app, &QApplication::quit);

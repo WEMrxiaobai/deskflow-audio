@@ -6,6 +6,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QHash>
 #include <QObject>
 #include <QStringList>
 #include <memory>
@@ -35,7 +36,8 @@ public:
   explicit PairedAudioControl(QObject *parent = nullptr);
   ~PairedAudioControl() override;
   void setConfiguration(const Configuration &configuration);
-  void configure(bool server, bool keyboardReady, const QString &serverHost, const QStringList &connectedNames = {});
+  void configure(bool server, bool keyboardReady, const QString &serverHost, const QHash<QString, QString> &connectedIdentities = {},
+                 const QString &serverFingerprint = {});
   void send(const QString &id, const QJsonObject &message);
   QStringList peerIds() const;
   QString peerAddress(const QString &id) const;

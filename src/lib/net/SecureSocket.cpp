@@ -403,6 +403,19 @@ void SecureSocket::freeSSL()
   }
 }
 
+QString SecureSocket::authenticatedPeerFingerprint()
+{
+  std::scoped_lock ssl_lock{ssl_mutex_};
+  if (!m_secureReady || m_securityLevel != SecurityLevel::PeerAuth || !m_ssl || !m_ssl->m_ssl)
+    return {};
+  auto *cert = SSL_get_peer_certificate(m_ssl->m_ssl);
+  if (!cert)
+    return {};
+  const auto digest = deskflow::sslCertFingerprint(cert, QCryptographicHash::Sha256);
+  X509_free(cert);
+  return QString::fromLatin1(digest.data.toHex());
+}
+
 int SecureSocket::secureAccept(int socket)
 {
   std::scoped_lock ssl_lock{ssl_mutex_};

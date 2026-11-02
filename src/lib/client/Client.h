@@ -156,6 +156,9 @@ public:
   */
   NetworkAddress getServerAddress() const;
 
+  //! Certificate of the authenticated TLS connection, or empty without one.
+  QString getServerFingerprint() const;
+
   //! Return last resolved adresses count
   size_t getLastResolvedAddressesCount() const
   {

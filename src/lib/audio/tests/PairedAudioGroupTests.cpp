@@ -14,7 +14,9 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QLockFile>
+#include <QLabel>
 #include <QProcess>
+#include <QPushButton>
 #include <QSlider>
 #include <QSslCertificate>
 #include <QTcpServer>
@@ -26,6 +28,7 @@
 #include <stdexcept>
 
 void failGroupReceiver(std::size_t slot);
+void failGroupRestore(int error);
 
 namespace {
 void check(bool value, const char *message)
@@ -115,6 +118,7 @@ void exercise(const QTemporaryDir &temporary, bool render)
   check(clients.write(hubDb) && servers.write(alphaDb) && servers.write(betaDb), "Cannot establish original trust");
   const auto hubBefore = contents(hubDb), alphaBefore = contents(alphaDb), betaBefore = contents(betaDb);
   const auto filesBefore = QDir(temporary.path()).entryList(QDir::Files);
+  const auto hubId = QString::fromLatin1(fingerprint(hubPem).data.toHex());
   const auto alphaId = QString::fromLatin1(fingerprint(alphaPem).data.toHex());
   const auto betaId = QString::fromLatin1(fingerprint(betaPem).data.toHex());
   QTcpServer reservation;
@@ -160,9 +164,9 @@ void exercise(const QTemporaryDir &temporary, bool render)
       }
   );
   hub.listen->setChecked(true);
-  hub.control->configure(true, true, {}, {"alpha", "beta"});
-  alpha.control->configure(false, true, "127.0.0.1");
-  beta.control->configure(false, true, "127.0.0.1");
+  hub.control->configure(true, true, {}, {{"alpha", alphaId}, {"beta", betaId}});
+  alpha.control->configure(false, true, "127.0.0.1", {}, hubId);
+  beta.control->configure(false, true, "127.0.0.1", {}, hubId);
   check(
       waitFor([&] { return receiving(hub, 2) && alphaSending && betaSending && !hubSending; }),
       "Server listener did not establish two independent sources"
@@ -186,8 +190,52 @@ void exercise(const QTemporaryDir &temporary, bool render)
       alphaControls && std::abs(alphaControls->volume.load() - .19f) < .0001f && alphaControls->muted,
       "Per-source controls were not applied"
   );
+  auto *senderButton = alpha.widget.findChild<QPushButton *>(QStringLiteral("audioStopButton"));
+  auto *restoreWarning = alpha.widget.findChild<QLabel *>(QStringLiteral("audioRestoreWarning"));
+  check(senderButton && restoreWarning, "Missing sender pause button or restoration warning");
+  const auto betaOffersBeforePause = betaOffers;
+  failGroupRestore(1);
+  senderButton->click();
+  check(waitFor([&] {
+    const auto sources = hub.group->sources();
+    return !alphaSending && sources.size() == 1 && sources[0].id == betaId &&
+           sources[0].status == QStringLiteral("正在接收");
+  }), "Pausing sender did not remove only its own source");
+  check(!restoreWarning->isHidden() && restoreWarning->text().contains(QStringLiteral("静音")),
+        "Failed restoration was not reported to the sender");
+  const auto betaBeforePause = hub.group->sources()[0].decodedPackets;
+  const auto callbacksBeforePause = output->renderedCallbacks();
+  check(waitFor([&] {
+    const auto sources = hub.group->sources();
+    return sources.size() == 1 && sources[0].id == betaId && sources[0].decodedPackets > betaBeforePause + 50 &&
+           output->renderedCallbacks() > callbacksBeforePause + 50;
+  }), "Healthy source or mixer stopped during sender pause");
+  check(sourceControl(hub, betaId) == stableBeta && output == hub.group->playbackForTest() &&
+            betaOffers == betaOffersBeforePause && hub.control->peerIds().size() == 2,
+        "Sender pause recreated the healthy source, mixer, or pairing");
+  senderButton->click();
+  check(waitFor([&] { return alphaSending && receiving(hub, 2); }), "Sender did not resume");
+  alphaControls = sourceControl(hub, alphaId);
+  check(alphaControls && alphaControls->muted && std::abs(alphaControls->volume.load() - .19f) < .0001f &&
+            sourceControl(hub, betaId) == stableBeta && output == hub.group->playbackForTest() &&
+            betaOffers == betaOffersBeforePause,
+        "Resuming sender changed controls or interrupted the healthy source");
+  restoreWarning->hide();
+  failGroupRestore(2);
+  senderButton->click();
+  check(waitFor([&] { return !alphaSending && hub.group->sources().size() == 1; }) && !restoreWarning->isHidden(),
+        "Restoration timeout was not reported");
+  senderButton->click();
+  check(waitFor([&] { return alphaSending && receiving(hub, 2); }) && sourceControl(hub, betaId) == stableBeta &&
+            output == hub.group->playbackForTest(), "Sender did not recover after restoration timeout");
+  alphaControls = sourceControl(hub, alphaId);
   const auto offersBeforeFailure = betaOffers;
-  failGroupReceiver(initialSources[alphaRow].playbackSlot);
+  const auto resumedSources = hub.group->sources();
+  const auto resumedAlpha = std::find_if(resumedSources.begin(), resumedSources.end(), [&](const auto &source) {
+    return source.id == alphaId;
+  });
+  check(resumedAlpha != resumedSources.end(), "Resumed sender source is missing");
+  failGroupReceiver(resumedAlpha->playbackSlot);
   check(
       waitFor([&] {
         for (const auto &source : hub.group->sources())
@@ -217,7 +265,7 @@ void exercise(const QTemporaryDir &temporary, bool render)
           hub.group->playbackForTest() == output,
       "Other source or playback was recreated on disconnect"
   );
-  alpha.control->configure(false, true, "127.0.0.1");
+  alpha.control->configure(false, true, "127.0.0.1", {}, hubId);
   check(waitFor([&] { return receiving(hub, 2); }), "Source did not reconnect automatically");
   alphaControls = sourceControl(hub, alphaId);
   check(
@@ -260,7 +308,7 @@ void exercise(const QTemporaryDir &temporary, bool render)
       "Client listener lost its server source when the other client left"
   );
   clientOutput.reset();
-  beta.control->configure(false, true, "127.0.0.1");
+  beta.control->configure(false, true, "127.0.0.1", {}, hubId);
   check(waitFor([&] { return receiving(alpha, 2); }), "Delegated source failed to reconnect");
   beta.listen->setChecked(true);
   pump(150);
@@ -302,7 +350,7 @@ void exercise(const QTemporaryDir &temporary, bool render)
       "Group routing changed trust or created invitation files"
   );
   std::cout << "three_widgets=pass server_listener_two_sources=pass client_listener_two_sources=pass "
-               "single_mixer=pass media_only_retry=pass independent_disconnect_reconnect=pass "
+               "single_mixer=pass media_only_retry=pass sender_pause_resume=pass independent_disconnect_reconnect=pass "
                "source_gain_mute_persistence=pass "
                "listener_election=pass broker_spoof_rejected=pass legacy_downgrade_recovery=pass trust_unchanged=pass "
                "real_render="

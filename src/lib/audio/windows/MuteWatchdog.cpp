@@ -72,6 +72,7 @@ struct MuteWatchdog::Impl
 {
   Handle input, output, process;
   bool healthy = false;
+  HRESULT lastFailure = S_OK;
   HRESULT command(mute_watchdog_detail::Operation operation) noexcept
   {
     const mute_watchdog_detail::Command command{operation, 0};
@@ -79,6 +80,7 @@ struct MuteWatchdog::Impl
     if (SUCCEEDED(hr))
       hr = readReply(output.value, process.value);
     if (FAILED(hr)) {
+      lastFailure = hr;
       healthy = false;
       // EOF is the independent helper's cleanup signal. NEVER TerminateProcess:
       // killing the only owner would prevent restoration.
@@ -215,6 +217,8 @@ HRESULT MuteWatchdog::stop() noexcept
   HRESULT hr = S_OK;
   if (running())
     hr = s.command(mute_watchdog_detail::Operation::Quit);
+  else
+    hr = FAILED(s.lastFailure) ? s.lastFailure : HRESULT_FROM_WIN32(ERROR_PROCESS_ABORTED);
   s.input.reset();
   s.output.reset();
   // Even on timeout, closing the command pipe requests safe restoration. The

@@ -36,6 +36,7 @@ Q_SIGNALS:
   void statusChanged(const QString &);
   void senderChanged(bool sharing, bool overridden);
   void sourcesChanged();
+  void localPlaybackRestoreFailed();
 
 private:
   struct Impl;

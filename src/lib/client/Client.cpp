@@ -25,6 +25,7 @@
 #include "deskflow/ProtocolUtil.h"
 #include "deskflow/StreamChunker.h"
 #include "deskflow/ipc/CoreIpc.h"
+#include "io/StreamFilter.h"
 #include "net/IDataSocket.h"
 #include "net/ISocketFactory.h"
 #include "net/SecureSocket.h"
@@ -189,6 +190,13 @@ bool Client::isConnecting() const
 NetworkAddress Client::getServerAddress() const
 {
   return m_serverAddress;
+}
+
+QString Client::getServerFingerprint() const
+{
+  auto *filter = dynamic_cast<StreamFilter *>(m_stream);
+  auto *socket = filter ? dynamic_cast<SecureSocket *>(filter->getStream()) : nullptr;
+  return socket ? socket->authenticatedPeerFingerprint() : QString();
 }
 
 size_t Client::getMaximumClipboardReceiveSizeBytes() const

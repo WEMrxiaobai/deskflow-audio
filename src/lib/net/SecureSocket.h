@@ -59,6 +59,7 @@ public:
     m_fatal = b;
   }
   bool isSecureReady() const;
+  QString authenticatedPeerFingerprint();
   void secureConnect();
   void secureAccept();
   int secureRead(void *buffer, int size, int &read);

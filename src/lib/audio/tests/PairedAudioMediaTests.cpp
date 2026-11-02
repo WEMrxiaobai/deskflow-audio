@@ -227,8 +227,8 @@ int main(int argc, char **argv)
     receiver.stop = true;
     sender.stop = true;
   });
-  receiverControl.configure(true, true, {}, {QStringLiteral("original-client")});
-  senderControl.configure(false, true, QStringLiteral("127.0.0.1:24800"));
+  receiverControl.configure(true, true, {}, {{QStringLiteral("original-client"), QString::fromLatin1(QSslCertificate::fromPath(senderPem).first().digest(QCryptographicHash::Sha256).toHex())}});
+  senderControl.configure(false, true, QStringLiteral("127.0.0.1:24800"), {}, QString::fromLatin1(QSslCertificate::fromPath(receiverPem).first().digest(QCryptographicHash::Sha256).toHex()));
   if (!waitFor([&] { return invalid || (receiver.done && sender.done); }, 12000) || invalid)
     return 5;
   if (!receiver.succeeded || !sender.succeeded || !receiver.connected || !sender.connected ||

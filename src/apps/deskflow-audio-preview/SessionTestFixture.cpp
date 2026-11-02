@@ -4,6 +4,16 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <string>
+#include <atomic>
+#include <chrono>
+#include <thread>
+std::atomic<bool> holdPrepare{false}, prepareEntered{false};
+void sessionPrepareHook(const std::atomic<bool> &stop)
+{
+  prepareEntered = true;
+  while (holdPrepare && !stop)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
 namespace {
 HANDLE testSessionMutex(LPSECURITY_ATTRIBUTES attributes, BOOL owner, LPCWSTR name)
 {
@@ -12,5 +22,6 @@ HANDLE testSessionMutex(LPSECURITY_ATTRIBUTES attributes, BOOL owner, LPCWSTR na
 }
 } // namespace
 #define CreateMutexW testSessionMutex
+#define DESKFLOW_SESSION_TEST_PREPARE_HOOK
 #include "Session.cpp"
 #undef CreateMutexW

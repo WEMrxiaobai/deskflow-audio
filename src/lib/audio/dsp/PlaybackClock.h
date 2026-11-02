@@ -22,9 +22,28 @@ public:
   {
     m_sequence.fetch_add(1);
   }
-  void end(std::uint64_t callbackNs, std::size_t consumedFrames) noexcept
+  void end(std::uint64_t callbackNs, std::size_t consumedFrames, std::uint32_t rate = 0) noexcept
   {
-    m_callbackNs.store(callbackNs);
+    // A delayed device wake can lead to several bounded submissions before
+    // earlier submissions have played. Carry their nominal unplayed frames;
+    // reject the snapshot if the total exceeds the model's 10 ms bound.
+    bool tooMuchPending = false;
+    if (rate && callbackNs) {
+      if (m_lastNs && callbackNs >= m_lastNs) {
+        const double elapsed = double(callbackNs - m_lastNs) * double(rate) / 1e9;
+        m_outstanding = std::max(0.0, m_outstanding - elapsed);
+      } else {
+        m_outstanding = 0;
+      }
+      m_outstanding += double(consumedFrames);
+      m_lastNs = callbackNs;
+      tooMuchPending = m_outstanding > double((rate + 99u) / 100u) + 0.5;
+      consumedFrames = tooMuchPending ? 0 : static_cast<std::size_t>(std::ceil(m_outstanding));
+    } else if (rate) {
+      m_lastNs = 0;
+      m_outstanding = 0;
+    }
+    m_callbackNs.store(tooMuchPending ? 0 : callbackNs);
     m_consumed.store(consumedFrames);
     m_sequence.fetch_add(1);
   }
@@ -67,5 +86,7 @@ public:
 private:
   std::atomic<std::uint64_t> m_sequence{0}, m_callbackNs{0};
   std::atomic<std::size_t> m_consumed{0};
+  std::uint64_t m_lastNs = 0; // Writer only.
+  double m_outstanding = 0;
 };
 } // namespace deskflow::audio::dsp

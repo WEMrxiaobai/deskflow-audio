@@ -20,6 +20,10 @@
 #include "deskflow/StreamChunker.h"
 #include "deskflow/ipc/CoreIpc.h"
 #include "net/TCPSocket.h"
+#include "net/SecureSocket.h"
+#include "io/StreamFilter.h"
+#include <QJsonDocument>
+#include <QJsonObject>
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
 #include "server/ClientProxyUnknown.h"
@@ -318,11 +322,20 @@ void Server::sendConnectedClientsIpc() const
 {
   const auto primaryName = getName(m_primaryClient);
   QStringList clientList;
-  for (const auto &[name, _] : m_clients) {
+  QJsonObject identities;
+  for (const auto &[name, client] : m_clients) {
     if (name != primaryName) {
       clientList.append(QString::fromStdString(name));
+      auto *proxy = dynamic_cast<ClientProxy *>(client);
+      auto *filter = proxy ? dynamic_cast<StreamFilter *>(proxy->getStream()) : nullptr;
+      auto *socket = filter ? dynamic_cast<SecureSocket *>(filter->getStream()) : nullptr;
+      const auto fingerprint = socket ? socket->authenticatedPeerFingerprint() : QString();
+      if (!fingerprint.isEmpty())
+        identities.insert(QString::fromStdString(client->getName()), fingerprint);
     }
   }
+  const auto json = QJsonDocument(identities).toJson(QJsonDocument::Compact);
+  ipcSendToClient("keyboardClientIdentities", QString::fromLatin1(json.toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals)));
   ipcSendToClient("connectedClients", clientList.join(","));
 }
 

@@ -272,8 +272,8 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, const QString &
   widget.show();
   listen->click(); // Actual production switch drives offer creation and routing.
   check(listen->isChecked() && Settings::value(Settings::Gui::AudioListen).toBool(), "Widget switch did not enable");
-  control->configure(true, true, {}, {QStringLiteral("original-client")});
-  remote.configure(false, true, QStringLiteral("127.0.0.1"));
+  control->configure(true, true, {}, {{QStringLiteral("original-client"), QString::fromLatin1(QSslCertificate::fromPath(clientPem).first().digest(QCryptographicHash::Sha256).toHex())}});
+  remote.configure(false, true, QStringLiteral("127.0.0.1"), {}, QString::fromLatin1(QSslCertificate::fromPath(serverPem).first().digest(QCryptographicHash::Sha256).toHex()));
   check(
       waitFor(
           [&] {

@@ -2,6 +2,7 @@
 // Standalone tests: no Qt, DSP, codec, CMake integration, or third-party library.
 #include "../WasapiBackend.h"
 #include "../WasapiPcm.h"
+#include "../DeviceNotificationFilter.h"
 
 #include <array>
 #include <atomic>
@@ -36,8 +37,39 @@ WAVEFORMATEX basic(WORD tag, WORD bits)
   return f;
 }
 
+void notifications()
+{
+  DeviceNotificationFilter defaultDevice(true);
+  CHECK(!defaultDevice.endpointChanged(L"microphone"));
+  defaultDevice.setEndpoint(L"render-1");
+  CHECK(defaultDevice.endpointChanged(L"render-1"));
+  CHECK(!defaultDevice.endpointChanged(L"microphone"));
+  CHECK(!defaultDevice.endpointChanged(L"render-2"));
+  CHECK(!defaultDevice.endpointChanged(nullptr));
+  CHECK(defaultDevice.defaultChanged(true, true));
+  CHECK(!defaultDevice.defaultChanged(false, true));
+  CHECK(!defaultDevice.defaultChanged(true, false));
+  defaultDevice.setEndpoint(L"render-2");
+  CHECK(!defaultDevice.endpointChanged(L"render-1"));
+  CHECK(defaultDevice.endpointChanged(L"render-2"));
+  DeviceNotificationFilter fixedDevice(false);
+  fixedDevice.setEndpoint(L"render-1");
+  CHECK(!fixedDevice.defaultChanged(true, true));
+  CHECK(fixedDevice.endpointChanged(L"render-1"));
+}
+
 void formats()
 {
+  // A late wakeup can expose the entire device buffer; subsequent timed polls
+  // must refill it over multiple bounded callbacks, including fractional rates.
+  CHECK(renderQuantum(1920, 48000) == 480);
+  CHECK(renderQuantum(240, 48000) == 240);
+  CHECK(renderQuantum(1000, 44101) == 442);
+  CHECK(renderQuantum(0, 48000) == 0);
+  std::uint32_t remaining = 1920;
+  for (int i = 0; i < 4; ++i)
+    remaining -= renderQuantum(remaining, 48000);
+  CHECK(remaining == 0);
   PcmLayout layout;
   auto f = basic(WAVE_FORMAT_IEEE_FLOAT, 32);
   CHECK(parseFormat(f, layout) && layout.type == SampleType::Float32);
@@ -291,6 +323,7 @@ void volume()
 int main(int argc, char **argv)
 {
   formats();
+  notifications();
   conversions();
   if (argc > 1 && std::strcmp(argv[1], "--smoke") == 0) {
     volume();

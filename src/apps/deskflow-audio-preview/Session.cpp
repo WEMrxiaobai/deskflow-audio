@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -54,6 +55,10 @@ std::shared_ptr<LocalOutputState> createLocalOutputState()
 {
   return std::make_shared<LocalOutputState>();
 }
+bool restoreLocalOutputState(const std::shared_ptr<LocalOutputState> &state) noexcept
+{
+  return !state || SUCCEEDED(state->watchdog.stop());
+}
 } // namespace preview
 namespace {
 void notify(
@@ -68,15 +73,84 @@ void notify(
   } catch (...) {
   }
 }
+// Normalize IPv4 into mapped IPv6 on dual-stack sockets, preserving endpoint identity.
+struct Endpoint
+{
+  sockaddr_storage address{};
+  int size = 0;
+};
+bool parseEndpoint(const std::string &text, std::uint16_t port, bool dualStack, Endpoint &out)
+{
+  IN_ADDR ipv4{};
+  IN6_ADDR ipv6{};
+  if (InetPtonA(AF_INET, text.c_str(), &ipv4) == 1) {
+    if (!dualStack) {
+      auto &a = *reinterpret_cast<sockaddr_in *>(&out.address);
+      a.sin_family = AF_INET;
+      a.sin_port = htons(port);
+      a.sin_addr = ipv4;
+      out.size = sizeof(a);
+    } else {
+      auto &a = *reinterpret_cast<sockaddr_in6 *>(&out.address);
+      a.sin6_family = AF_INET6;
+      a.sin6_port = htons(port);
+      a.sin6_addr.u.Byte[10] = a.sin6_addr.u.Byte[11] = 0xff;
+      std::memcpy(&a.sin6_addr.u.Byte[12], &ipv4, sizeof(ipv4));
+      out.size = sizeof(a);
+    }
+    return true;
+  }
+  if (!dualStack || InetPtonA(AF_INET6, text.c_str(), &ipv6) != 1 || IN6_IS_ADDR_LINKLOCAL(&ipv6))
+    return false; // A remote interface index is not meaningful on this host.
+  auto &a = *reinterpret_cast<sockaddr_in6 *>(&out.address);
+  a.sin6_family = AF_INET6;
+  a.sin6_port = htons(port);
+  a.sin6_addr = ipv6;
+  out.size = sizeof(a);
+  return true;
+}
+bool sameAddress(const Endpoint &a, const Endpoint &b)
+{
+  if (a.address.ss_family != b.address.ss_family)
+    return false;
+  if (a.address.ss_family == AF_INET)
+    return reinterpret_cast<const sockaddr_in *>(&a.address)->sin_addr.s_addr ==
+           reinterpret_cast<const sockaddr_in *>(&b.address)->sin_addr.s_addr;
+  const auto &x = *reinterpret_cast<const sockaddr_in6 *>(&a.address);
+  const auto &y = *reinterpret_cast<const sockaddr_in6 *>(&b.address);
+  return std::memcmp(&x.sin6_addr, &y.sin6_addr, sizeof(x.sin6_addr)) == 0 && x.sin6_scope_id == y.sin6_scope_id;
+}
+bool sameEndpoint(const Endpoint &a, const Endpoint &b)
+{
+  if (!sameAddress(a, b))
+    return false;
+  if (a.address.ss_family == AF_INET)
+    return reinterpret_cast<const sockaddr_in *>(&a.address)->sin_port ==
+           reinterpret_cast<const sockaddr_in *>(&b.address)->sin_port;
+  return reinterpret_cast<const sockaddr_in6 *>(&a.address)->sin6_port ==
+         reinterpret_cast<const sockaddr_in6 *>(&b.address)->sin6_port;
+}
 struct Network
 {
   SOCKET socketHandle = INVALID_SOCKET;
+  bool dualStack = false;
   Network()
   {
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data))
       throw std::runtime_error("WSAStartup failed");
-    socketHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    socketHandle = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (socketHandle != INVALID_SOCKET) {
+      DWORD disabled = 0;
+      if (setsockopt(socketHandle, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&disabled), sizeof(disabled)) == 0)
+        dualStack = true;
+      else {
+        closesocket(socketHandle);
+        socketHandle = INVALID_SOCKET;
+      }
+    }
+    if (!dualStack)
+      socketHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socketHandle == INVALID_SOCKET) {
       WSACleanup();
       throw std::runtime_error("UDP socket failed");
@@ -95,30 +169,32 @@ struct Network
   }
   std::uint16_t bindReceiver()
   {
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(socketHandle, reinterpret_cast<sockaddr *>(&a), sizeof(a)))
-      throw std::runtime_error("Cannot bind receiver");
-    int size = sizeof(a);
-    if (getsockname(socketHandle, reinterpret_cast<sockaddr *>(&a), &size))
-      throw std::runtime_error("Cannot query receiver port");
-    return ntohs(a.sin_port);
+    Endpoint a;
+    if (dualStack) {
+      auto &ip = *reinterpret_cast<sockaddr_in6 *>(&a.address);
+      ip.sin6_family = AF_INET6;
+      a.size = sizeof(ip);
+    } else {
+      auto &ip = *reinterpret_cast<sockaddr_in *>(&a.address);
+      ip.sin_family = AF_INET;
+      a.size = sizeof(ip);
+    }
+    if (bind(socketHandle, reinterpret_cast<sockaddr *>(&a.address), a.size) ||
+        getsockname(socketHandle, reinterpret_cast<sockaddr *>(&a.address), &a.size))
+      throw std::runtime_error("Cannot bind or query receiver port");
+    return dualStack ? ntohs(reinterpret_cast<sockaddr_in6 *>(&a.address)->sin6_port)
+                     : ntohs(reinterpret_cast<sockaddr_in *>(&a.address)->sin_port);
   }
-  bool sendTo(std::span<const std::uint8_t> bytes, const sockaddr_in &a) noexcept
+  bool sendTo(std::span<const std::uint8_t> bytes, const Endpoint &a) noexcept
   {
-    return sendto(
-               socketHandle, reinterpret_cast<const char *>(bytes.data()), static_cast<int>(bytes.size()), 0,
-               reinterpret_cast<const sockaddr *>(&a), sizeof(a)
-           ) == static_cast<int>(bytes.size());
+    return sendto(socketHandle, reinterpret_cast<const char *>(bytes.data()), static_cast<int>(bytes.size()), 0,
+                  reinterpret_cast<const sockaddr *>(&a.address), a.size) == static_cast<int>(bytes.size());
   }
-  int receive(std::span<std::uint8_t> bytes, sockaddr_in &from)
+  int receive(std::span<std::uint8_t> bytes, Endpoint &from)
   {
-    int size = sizeof(from);
-    const int n = recvfrom(
-        socketHandle, reinterpret_cast<char *>(bytes.data()), static_cast<int>(bytes.size()), 0,
-        reinterpret_cast<sockaddr *>(&from), &size
-    );
+    from.size = sizeof(from.address);
+    const int n = recvfrom(socketHandle, reinterpret_cast<char *>(bytes.data()), static_cast<int>(bytes.size()), 0,
+                           reinterpret_cast<sockaddr *>(&from.address), &from.size);
     if (n == SOCKET_ERROR) {
       const auto error = WSAGetLastError();
       if (error == WSAEWOULDBLOCK || error == WSAEMSGSIZE || error == WSAECONNRESET)
@@ -128,24 +204,17 @@ struct Network
     return n;
   }
 };
-bool sameEndpoint(const sockaddr_in &a, const sockaddr_in &b)
-{
-  return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
-}
 std::vector<std::string> addresses()
 {
   ULONG size = 16384;
   std::vector<std::uint8_t> memory(size);
   auto *head = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(memory.data());
-  auto result = GetAdaptersAddresses(
-      AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, head, &size
-  );
+  constexpr auto flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+  auto result = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, head, &size);
   if (result == ERROR_BUFFER_OVERFLOW) {
     memory.resize(size);
     head = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(memory.data());
-    result = GetAdaptersAddresses(
-        AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, head, &size
-    );
+    result = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, head, &size);
   }
   std::vector<std::string> out;
   if (result == NO_ERROR)
@@ -153,11 +222,19 @@ std::vector<std::string> addresses()
       if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
         continue;
       for (auto *u = a->FirstUnicastAddress; u && out.size() < 8; u = u->Next) {
-        if (u->Address.lpSockaddr->sa_family != AF_INET)
-          continue;
-        char text[INET_ADDRSTRLEN]{};
-        const auto *ipv4 = reinterpret_cast<sockaddr_in *>(u->Address.lpSockaddr);
-        if (InetNtopA(AF_INET, const_cast<IN_ADDR *>(&ipv4->sin_addr), text, sizeof(text)))
+        auto *address = u->Address.lpSockaddr;
+        char text[INET6_ADDRSTRLEN]{};
+        const void *ip = nullptr;
+        if (address->sa_family == AF_INET)
+          ip = &reinterpret_cast<sockaddr_in *>(address)->sin_addr;
+        else if (address->sa_family == AF_INET6) {
+          const auto &v6 = reinterpret_cast<sockaddr_in6 *>(address)->sin6_addr;
+          if (IN6_IS_ADDR_LINKLOCAL(&v6))
+            continue;
+          ip = &v6;
+        }
+        if (ip && InetNtopA(address->sa_family, const_cast<void *>(ip), text, sizeof(text)) &&
+            std::find(out.begin(), out.end(), text) == out.end())
           out.emplace_back(text);
       }
     }
@@ -170,7 +247,7 @@ struct Device
   std::atomic<ae::AudioSender *> sender{nullptr};
   std::atomic<ae::AudioReceiver *> receiver{nullptr};
   std::atomic<std::uint64_t> generation{0}, active{0}, renderedCallbacks{0}, capturedCallbacks{0};
-  std::atomic<std::uint32_t> rate{0}, channels{0};
+  std::atomic<std::uint32_t> rate{0}, channels{0}, channelMask{0};
   std::atomic<bool> failed{false};
   static void status(void *p, const aw::Status &s) noexcept
   {
@@ -178,6 +255,7 @@ struct Device
     if (s.state == aw::State::Running) {
       d.rate = s.format.sampleRate;
       d.channels = s.format.channels;
+      d.channelMask = s.format.channelMask;
       d.generation.store(s.format.generation, std::memory_order_release);
     } else if (s.state == aw::State::Failed || s.state == aw::State::RetryPending)
       d.failed = true;
@@ -234,6 +312,9 @@ void runInternal(
   if (options.handshakeTimeout <= std::chrono::milliseconds::zero() ||
       options.handshakeTimeout > std::chrono::minutes(1))
     throw std::invalid_argument("handshakeTimeout must be between 1 and 60000 milliseconds");
+  if (options.firstMediaTimeout <= std::chrono::milliseconds::zero() ||
+      options.firstMediaTimeout > std::chrono::minutes(1))
+    throw std::invalid_argument("firstMediaTimeout must be between 1 and 60000 milliseconds");
   if (receive && options.invitation)
     throw std::invalid_argument("Receiver generates its own fresh invitation");
   if (!receive && options.invitation && !path.empty())
@@ -290,7 +371,7 @@ void runInternal(
   if (stopping.load())
     return;
   auto nonce = receive ? preview::Nonce{} : preview::randomNonce();
-  sockaddr_in peer{};
+  Endpoint peer{};
   bool connected = false;
   std::array<std::uint8_t, 1201> packet{};
   aw::WorkerTimer timer;
@@ -301,7 +382,9 @@ void runInternal(
       observer, receive ? preview::SessionState::Waiting : preview::SessionState::Connecting,
       receive ? "等待发送端授权连接..." : "正在连接接收电脑..."
   );
-  while (!connected && !stopping && preview::unixSeconds() < invite.value.expiresUnixSeconds) {
+  while (!connected && !stopping &&
+         (receive ? preview::unixSeconds() < invite.value.expiresUnixSeconds
+                  : preview::validInvitationExpiry(invite.value.expiresUnixSeconds, preview::unixSeconds()))) {
     const auto now = ae::monotonicNowNs();
     if (now >= deadline) {
       if (stopping.load())
@@ -314,15 +397,13 @@ void runInternal(
     }
     if (!receive && now >= nextHello) {
       for (const auto &address : invite.value.addresses) {
-        sockaddr_in target{};
-        target.sin_family = AF_INET;
-        target.sin_port = htons(invite.value.port);
-        if (InetPtonA(AF_INET, address.c_str(), &target.sin_addr) == 1)
+        Endpoint target{};
+        if (parseEndpoint(address, invite.value.port, network.dualStack, target))
           (void)network.sendTo(hello, target);
       }
       nextHello = now + 500000000ULL;
     }
-    sockaddr_in from{};
+    Endpoint from{};
     const auto bytes = network.receive(packet, from);
     if (bytes) {
       preview::ControlType type{};
@@ -330,9 +411,9 @@ void runInternal(
       if (preview::verifyControl(invite.value, std::span(packet.data(), bytes), type, received)) {
         if (receive && type == preview::ControlType::Hello) {
           if (!options.expectedSenderAddress.empty()) {
-            IN_ADDR expected{};
-            if (InetPtonA(AF_INET, options.expectedSenderAddress.c_str(), &expected) != 1 ||
-                expected.s_addr != from.sin_addr.s_addr)
+            Endpoint expected{};
+            if (!parseEndpoint(options.expectedSenderAddress, 0, network.dualStack, expected) ||
+                !sameAddress(expected, from))
               continue;
           }
           peer = from;
@@ -342,9 +423,8 @@ void runInternal(
         if (!receive && type == preview::ControlType::Ack && received == nonce) {
           bool expected = false;
           for (const auto &address : invite.value.addresses) {
-            IN_ADDR ip{};
-            if (InetPtonA(AF_INET, address.c_str(), &ip) == 1 && ip.s_addr == from.sin_addr.s_addr &&
-                ntohs(from.sin_port) == invite.value.port)
+            Endpoint target{};
+            if (parseEndpoint(address, invite.value.port, network.dualStack, target) && sameEndpoint(target, from))
               expected = true;
           }
           if (expected) {
@@ -366,7 +446,7 @@ void runInternal(
   struct StopGuard
   {
     Network &network;
-    sockaddr_in peer;
+    Endpoint peer;
     std::vector<std::uint8_t> packet;
     bool enabled;
     ~StopGuard()
@@ -406,8 +486,12 @@ void runInternal(
   std::wstring captureEndpoint;
   if (manageLocalOutput && FAILED(aw::WasapiBackend::defaultRenderEndpointId(captureEndpoint)))
     throw std::runtime_error("无法读取共享音频设备，本机静音未修改");
-  if (options.sharedPlayback)
-    format = options.sharedPlayback->prepare();
+  if (options.sharedPlayback) {
+    const auto prepared = options.sharedPlayback->prepare(stopping);
+    if (!prepared)
+      return;
+    format = *prepared;
+  }
   else if (useDevice) {
     aw::Callbacks callbacks{&device, Device::capture, Device::render, Device::status};
     backend = std::make_unique<aw::WasapiBackend>(
@@ -422,7 +506,7 @@ void runInternal(
       return;
     if (!device.generation)
       throw std::runtime_error("5秒内未打开默认声卡");
-    format = {device.rate.load(), device.channels.load()};
+    format = {device.rate.load(), device.channels.load(), device.channelMask.load()};
     device.active = device.generation.load();
   }
   if (receive) {
@@ -446,9 +530,8 @@ void runInternal(
   if (receive)
     (void)network.sendTo(ack, peer);
   notify(
-      observer, preview::SessionState::Connected,
-      receive ? (test && !testRender ? "已连接：测试模式仅解码丢弃，不播放。"
-                                     : "已连接：正在播放远端系统声音（初始音量35%）。")
+      observer, receive ? preview::SessionState::Waiting : preview::SessionState::Connected,
+      receive ? "音频协商完成，等待远端声音..."
               : "已连接：正在发送系统声音，请在本机播放音乐。"
   );
   auto start = ae::monotonicNowNs(), nextTone = start, nextRender = start, nextReport = start;
@@ -479,7 +562,7 @@ void runInternal(
       nextLocalOutputCheck = now + 100000000ULL;
     }
     for (unsigned work = 0; work < 32; ++work) {
-      sockaddr_in from{};
+      Endpoint from{};
       const auto bytes = network.receive(packet, from);
       if (!bytes)
         break;
@@ -516,6 +599,11 @@ void runInternal(
         receiver->setMuted(options.playbackControl->muted.load());
       }
       receiver->tick(now);
+      if (receiver->stats().authenticatedPackets == 0 &&
+          now - start >= static_cast<std::uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(options.firstMediaTimeout).count()
+                         ))
+        throw std::runtime_error("等待首个音频数据包超时，需要重新建立会话");
       if (test && !testRender && !options.sharedPlayback && now >= nextRender) {
         (void)receiver->render(discard);
         for (float sample : discard)
@@ -544,7 +632,8 @@ void runInternal(
         packets = sender->stats().sentPackets;
         text << "sent=" << packets;
       }
-      notify(observer, preview::SessionState::Connected, text.str(), packets);
+      notify(observer, receive && !packets ? preview::SessionState::Waiting : preview::SessionState::Connected,
+             text.str(), packets);
       nextReport = now + 1000000000ULL;
     }
     timer.waitMicroseconds(500);
@@ -567,7 +656,8 @@ void runInternal(
     finalPackets = sender->stats().sentPackets;
     finalText << "final_sent=" << finalPackets << " device_capture_callbacks=" << device.capturedCallbacks.load();
   }
-  notify(observer, preview::SessionState::Connected, finalText.str(), finalPackets);
+  notify(observer, receive && !finalPackets ? preview::SessionState::Waiting : preview::SessionState::Connected,
+         finalText.str(), finalPackets);
   if (test) {
     if (testCapture && device.capturedCallbacks.load() < 100)
       throw std::runtime_error("真实系统声音测试未产生足够采集回调");
@@ -584,7 +674,7 @@ namespace preview {
 struct SharedPlayback::Impl
 {
   const bool test, testRender;
-  std::mutex setup;
+  std::timed_mutex setup;
   Device device;
   std::array<std::atomic<ae::AudioReceiver *>, 2> sources{};
   std::atomic<unsigned> readers{0};
@@ -643,9 +733,17 @@ SharedPlayback::SharedPlayback(bool test, bool testRender) : d(std::make_unique<
 {
 }
 SharedPlayback::~SharedPlayback() = default;
-PcmFormat SharedPlayback::prepare()
+std::optional<PcmFormat> SharedPlayback::prepare(const std::atomic<bool> &stop)
 {
-  std::lock_guard lock(d->setup);
+  std::unique_lock lock(d->setup, std::defer_lock);
+  while (!stop.load() && !lock.try_lock_for(std::chrono::milliseconds(10))) {}
+  if (stop.load())
+    return std::nullopt;
+#ifdef DESKFLOW_SESSION_TEST_PREPARE_HOOK
+  sessionPrepareHook(stop);
+  if (stop.load())
+    return std::nullopt;
+#endif
   if (d->prepared && d->healthy())
     return d->format;
   for (auto &source : d->sources)
@@ -671,11 +769,13 @@ PcmFormat SharedPlayback::prepare()
     if (!d->backend->start())
       throw std::runtime_error("无法启动收听设备");
     const auto until = ae::monotonicNowNs() + 5000000000ULL;
-    while (!d->device.generation && !d->device.failed && ae::monotonicNowNs() < until)
+    while (!stop.load() && !d->device.generation && !d->device.failed && ae::monotonicNowNs() < until)
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (stop.load())
+      return std::nullopt;
     if (!d->device.generation)
       throw std::runtime_error("5秒内未打开收听设备");
-    d->format = {d->device.rate.load(), d->device.channels.load()};
+    d->format = {d->device.rate.load(), d->device.channels.load(), d->device.channelMask.load()};
     d->device.active = d->device.generation.load();
   } else if (!d->synthetic.joinable()) {
     d->device.generation = 1;

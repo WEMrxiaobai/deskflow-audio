@@ -96,6 +96,9 @@ target_link_libraries(${lib_name}
   PRIVATE
     platform
 )
+if(WIN32)
+  target_link_libraries(${lib_name} PRIVATE Wtsapi32)
+endif()
 
 if(UNIX AND NOT APPLE)
   target_link_libraries(${lib_name} PRIVATE server)

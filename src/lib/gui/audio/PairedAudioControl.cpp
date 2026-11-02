@@ -83,6 +83,7 @@ struct PairedAudioControl::Impl
     QString name;
     bool tlsVerified = false;
     bool ready = false;
+    qint64 acceptedAt = 0;
     qint64 deadline = 0;
     qint64 lastSeen = 0;
     qint64 nextPing = 0;
@@ -93,7 +94,8 @@ struct PairedAudioControl::Impl
   bool keyboardReady = false;
   bool active = false;
   QString host;
-  QStringList names;
+  QString serverFingerprint;
+  QHash<QString, QString> identities;
   QString status;
   QTimer tick;
   QElapsedTimer clock; // All transport deadlines are monotonic, not wall time.
@@ -116,7 +118,7 @@ struct PairedAudioControl::Impl
         socket->deleteLater();
         return;
       }
-      if (!active || !server || sockets.size() >= 8) {
+      if (!active || !server || !admit(socket)) {
         socket->abort();
         socket->deleteLater();
         return;
@@ -127,6 +129,43 @@ struct PairedAudioControl::Impl
     tick.setInterval(1000);
     QObject::connect(&tick, &QTimer::timeout, q, [this] { maintain(); });
     tick.start();
+  }
+  bool admit(QSslSocket *incoming)
+  {
+    // Keep incomplete handshakes bounded per address and globally. An older
+    // unauthenticated attempt may yield to a newcomer, but never displace an
+    // authenticated peer. A minimum age gives honest handshakes time to finish.
+    constexpr int maxSockets = 8;
+    constexpr int maxPendingPerAddress = 2;
+    constexpr qint64 minimumHandshakeMs = 1000;
+    const auto now = clock.elapsed();
+    int sameAddress = 0;
+    QSslSocket *oldestSame = nullptr;
+    QSslSocket *oldest = nullptr;
+    auto older = [this](QSslSocket *a, QSslSocket *b) {
+      return !b || sockets.value(a).acceptedAt < sockets.value(b).acceptedAt;
+    };
+    for (auto it = sockets.cbegin(); it != sockets.cend(); ++it) {
+      if (it->tlsVerified)
+        continue;
+      if (it.key()->peerAddress() == incoming->peerAddress()) {
+        ++sameAddress;
+        if (older(it.key(), oldestSame))
+          oldestSame = it.key();
+      }
+      if (older(it.key(), oldest))
+        oldest = it.key();
+    }
+    auto *victim = sameAddress >= maxPendingPerAddress ? oldestSame
+                   : sockets.size() >= maxSockets ? oldest : nullptr;
+    if (victim) {
+      if (now - sockets.value(victim).acceptedAt < minimumHandshakeMs)
+        return false;
+      drop(victim);
+    } else if (sameAddress >= maxPendingPerAddress || sockets.size() >= maxSockets) {
+      return false;
+    }
+    return true;
   }
   void report(const QString &value)
   {
@@ -165,7 +204,7 @@ struct PairedAudioControl::Impl
     const bool settings = configuration.useSettings;
     const bool enabled = settings ? Settings::value(Settings::Security::TlsEnabled).toBool() : configuration.tlsEnabled;
     const bool check = settings ? Settings::value(Settings::Security::CheckPeers).toBool() : configuration.checkPeers;
-    if (!keyboardReady || !enabled || (server && !check))
+    if (!keyboardReady || !enabled || (server && !check) || (!server && serverFingerprint.isEmpty()))
       return false;
     if (QSslSocket::activeBackend() != QStringLiteral("openssl") &&
         !QSslSocket::setActiveBackend(QStringLiteral("openssl")))
@@ -231,7 +270,8 @@ struct PairedAudioControl::Impl
     socket->setSslConfiguration(config);
     socket->setReadBufferSize(kMaxFrame + 1);
     Peer peer;
-    peer.deadline = clock.elapsed() + 5000;
+    peer.acceptedAt = clock.elapsed();
+    peer.deadline = peer.acceptedAt + 5000;
     sockets.insert(socket, peer);
     QObject::connect(socket, &QSslSocket::sslErrors, q, [this, socket](const QList<QSslError> &errors) {
       if (!sockets.contains(socket) || !trusted(socket)) {
@@ -257,6 +297,10 @@ struct PairedAudioControl::Impl
       }
       it->tlsVerified = true;
       it->id = QString::fromLatin1(socket->peerCertificate().digest(QCryptographicHash::Sha256).toHex());
+      if (!server && it->id != serverFingerprint) {
+        drop(socket);
+        return;
+      }
       write(socket, {{QString::fromLatin1(kMarker), 1}, {QStringLiteral("name"), localName}});
     });
     QObject::connect(socket, &QSslSocket::readyRead, q, [this, socket] { read(socket); });
@@ -317,7 +361,7 @@ struct PairedAudioControl::Impl
           const auto name = nameValue.toString();
           if (message.value(QString::fromLatin1(kMarker)).toInt(-1) != 1 || !nameValue.isString() || name.isEmpty() ||
               name.size() > 255 || message.contains(QString::fromLatin1(kHeartbeat)) ||
-              (server && !names.contains(name))) {
+              (server && identities.value(name) != it->id)) {
             drop(socket);
             return;
           }
@@ -376,7 +420,7 @@ struct PairedAudioControl::Impl
       if (it == sockets.cend())
         continue;
       if ((!it->ready && now >= it->deadline) || (it->tlsVerified && !trusted(socket)) ||
-          (it->ready && now - it->lastSeen >= kPeerTimeoutMs) || (server && it->ready && !names.contains(it->name))) {
+          (it->ready && now - it->lastSeen >= kPeerTimeoutMs) || (server && it->ready && identities.value(it->name) != it->id)) {
         drop(socket);
         continue;
       }
@@ -417,16 +461,19 @@ void PairedAudioControl::setConfiguration(const Configuration &configuration)
   d->maintain();
 }
 void PairedAudioControl::configure(
-    bool server, bool keyboardReady, const QString &serverHost, const QStringList &connectedNames
+    bool server, bool keyboardReady, const QString &serverHost, const QHash<QString, QString> &connectedIdentities,
+    const QString &serverFingerprint
 )
 {
   const auto host = hostOnly(serverHost);
-  if (d->server != server || d->keyboardReady != keyboardReady || d->host != host)
+  if (d->server != server || d->keyboardReady != keyboardReady || d->host != host ||
+      (!server && d->serverFingerprint != serverFingerprint))
     d->stop();
   d->server = server;
   d->keyboardReady = keyboardReady;
   d->host = host;
-  d->names = connectedNames;
+  d->serverFingerprint = serverFingerprint;
+  d->identities = connectedIdentities;
   d->maintain();
 }
 void PairedAudioControl::send(const QString &id, const QJsonObject &message)

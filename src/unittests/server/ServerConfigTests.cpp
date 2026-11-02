@@ -8,6 +8,7 @@
 #include "ServerConfigTests.h"
 
 #include "server/Config.h"
+#include "server/RuntimeConfig.h"
 
 class OnlySystemFilter : public InputFilter::Condition
 {
@@ -29,6 +30,32 @@ public:
 };
 
 using namespace deskflow::server;
+
+void ServerConfigTests::runtimeLayoutReload()
+{
+  Config config(nullptr);
+  QJsonObject identity{{"mode", "server"}};
+  const std::string lf = "section: links\nend\n";
+  const std::string crlf = "section: links\r\nend\r\n";
+  parseRuntimeConfig(config, identity, lf);
+  QVERIFY(identity.value("configValid").toBool());
+  const Config lfConfig = config;
+  const auto lfHash = identity.value("configHash");
+  parseRuntimeConfig(config, identity, crlf);
+  QVERIFY(config == lfConfig);
+  const auto crlfIdentity = identity;
+  QVERIFY(identity.value("configValid").toBool());
+  QVERIFY(identity.value("configHash") != lfHash); // Hash exact bytes, including line endings.
+  bool failed = false;
+  try {
+    parseRuntimeConfig(config, identity, "section: invalid\nend\n");
+  } catch (const ServerConfigReadException &) {
+    failed = true;
+  }
+  QVERIFY(failed);
+  QVERIFY(config == lfConfig);
+  QCOMPARE(identity, crlfIdentity);
+}
 
 void ServerConfigTests::equalityCheck()
 {

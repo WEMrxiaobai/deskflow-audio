@@ -185,6 +185,40 @@ void adapterTests()
   CHECK(changing.process(sample, destination).outputFrames == 1 && near(destination[0], 3.001));
 }
 
+void surroundTests()
+{
+  for (const PcmFormat format : {PcmFormat{48000, 6, 0x3f}, PcmFormat{48000, 6, 0x60f},
+                                 PcmFormat{48000, 8, 0x63f}}) {
+    for (std::size_t channel = 0; channel < format.channels; ++channel) {
+      std::vector<float> input(format.channels);
+      input[channel] = 1;
+      const auto output = adapt(format, {48000, 2}, input, 1, 1);
+      CHECK(output.size() == 2);
+      if (channel == 2 || channel == 3)
+        CHECK(output[0] > 0 && near(output[0], output[1]));
+      else if (channel % 2 == 0)
+        CHECK(output[0] > 0 && output[1] == 0);
+      else
+        CHECK(output[1] > 0 && output[0] == 0);
+    }
+    std::vector<float> full(format.channels, 1.0f);
+    const auto mixed = adapt(format, {48000, 2}, full, 1, 1);
+    CHECK(near(mixed[0], 1) && near(mixed[1], 1));
+    const auto expanded = adapt({48000, 2}, format, {0.25f, -0.5f}, 1, 1);
+    CHECK(expanded.size() == format.channels && expanded[0] == .25f && expanded[1] == -.5f);
+    for (std::size_t channel = 2; channel < format.channels; ++channel)
+      CHECK(expanded[channel] == 0);
+    BandLimitedAdapter resample(format, {44100, 2});
+    std::vector<float> sustained(format.channels * 256, 1), output(512);
+    const auto progress = resample.process(sustained, output);
+    CHECK(progress.outputFrames > 100);
+    CHECK(near(output[(progress.outputFrames - 1) * 2], 1, .001));
+  }
+  throws([] { (void)StreamAdapter({48000, 6, 0}, {48000, 2}); });
+  throws([] { (void)StreamAdapter({48000, 8, 0xff}, {48000, 2}); });
+  throws([] { (void)StreamAdapter({48000, 4, 0x33}, {48000, 2}); });
+}
+
 void captureTests()
 {
   throws([] { (void)CapturePipeline({48000, 1}, {48000, 1}, 20, 2); });
@@ -412,6 +446,22 @@ void driftTests()
 
 void playbackClockTests()
 {
+  PlaybackClock delayed;
+  double pending = 0;
+  delayed.begin();
+  delayed.end(1000000000, 480, 48000);
+  CHECK(delayed.observe(1000000000, 48000, [] { return 0; }, pending));
+  delayed.begin();
+  delayed.end(1005000000, 480, 48000);
+  CHECK(!delayed.observe(1005000000, 48000, [] { return 0; }, pending));
+  delayed.begin();
+  delayed.end(1021000000, 240, 48000);
+  CHECK(delayed.observe(1021000000, 48000, [] { return 0; }, pending));
+  CHECK(near(pending, 240));
+  delayed.begin();
+  delayed.end(1023500000, 120, 48000);
+  CHECK(delayed.observe(1023500000, 48000, [] { return 0; }, pending));
+  CHECK(near(pending, 240)); // 120 remaining from the prior callback plus 120 new.
   PlaybackClock clock;
   double value = -1;
   CHECK(!clock.observe(1000000000, 48000, [] { return 240; }, value));
@@ -516,6 +566,7 @@ int main()
 {
   pcmTests();
   adapterTests();
+  surroundTests();
   captureTests();
   playbackTests();
   jitterTests();

@@ -485,6 +485,33 @@ void bandLimitedDeviceIntegration()
   std::array<float, 221> output{};
   require(receiver.render(output), "Adapted mono device render failed");
 }
+void surroundAndFractionalDeviceRate()
+{
+  PacketBox box;
+  AudioSender sender({48000, 6, 0x3f}, 5, config(), key(), [&](auto packet) { return box.put(packet); });
+  sender.start();
+  std::array<float, 240 * 6> input{};
+  for (std::size_t i = 0; i < 240; ++i)
+    input[i * 6 + 2] = .25f * std::sin(float(i) * .13f); // center only
+  require(sender.capture(input, false, monotonicNowNs()), "5.1 center capture rejected");
+  box.wait(1);
+  sender.stop();
+  AudioReceiver receiver({22050, 8, 0x63f}, 5, config(), key());
+  const auto now = monotonicNowNs();
+  require(receiver.ingest(box.packets.front(), now), "Surround packet authentication failed");
+  receiver.tick(now + 5 * ms);
+  require(receiver.stats().playbackFrames > 0, "22050 Hz receiver did not queue decoded audio");
+  std::array<float, 111 * 8> output{};
+  require(receiver.render(output), "22050 Hz 7.1 render failed");
+  float peak = 0;
+  for (std::size_t i = 0; i < 111; ++i) {
+    peak = std::max(peak, std::abs(output[i * 8]));
+    require(std::abs(output[i * 8] - output[i * 8 + 1]) < .0001f, "Center did not reach both front speakers");
+    for (std::size_t channel = 2; channel < 8; ++channel)
+      require(output[i * 8 + channel] == 0, "Stereo upmix invented surround or LFE content");
+  }
+  require(peak > .00001f, "Center-only capture was silent");
+}
 void lateReorderedPacketCannotStopForwardMedia()
 {
   DirectPackets packets;
@@ -557,6 +584,7 @@ int main()
     longGapRequiresTrustedResume();
     lateReorderedPacketCannotStopForwardMedia();
     bandLimitedDeviceIntegration();
+    surroundAndFractionalDeviceRate();
     std::cout << "Engine tests passed: worker/auth/5ms-startup/PLC/mute/overload/timeline/format/mix\n";
     return 0;
   } catch (const std::exception &error) {

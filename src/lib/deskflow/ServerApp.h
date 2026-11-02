@@ -14,6 +14,7 @@
 #include "net/NetworkAddress.h"
 #include "server/Config.h"
 
+#include <QJsonObject>
 #include <memory>
 
 enum class ServerState
@@ -116,4 +117,5 @@ private:
   NetworkAddress *m_deskflowAddress = nullptr;
   std::string m_name;
   std::shared_ptr<deskflow::server::Config> m_config;
+  QJsonObject m_runtimeIdentity;
 };

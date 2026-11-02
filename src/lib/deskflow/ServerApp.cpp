@@ -11,6 +11,8 @@
 #include "arch/Arch.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "common/CoreRuntimeIdentity.h"
+#include "server/RuntimeConfig.h"
 #include "common/ExitCodes.h"
 #include "common/PlatformInfo.h"
 #include "common/Settings.h"
@@ -30,6 +32,7 @@
 
 // must be before computer header includes
 #include <QFileInfo>
+#include <QJsonDocument>
 
 #if defined(Q_OS_WIN)
 #include "platform/MSWindowsComputer.h"
@@ -48,6 +51,7 @@
 #endif
 
 #include <fstream>
+#include <sstream>
 
 using namespace deskflow::server;
 
@@ -58,6 +62,7 @@ using namespace deskflow::server;
 ServerApp::ServerApp(IEventQueue *events, const QString &processName) : App(events, processName)
 {
   m_name = Settings::value(Settings::Core::ComputerName).toString().toStdString();
+  m_runtimeIdentity = coreRuntimeIdentity(true);
   // do nothing
 }
 
@@ -90,6 +95,9 @@ void ServerApp::reloadConfig()
     if (m_server != nullptr) {
       m_server->setConfig(*m_config);
     }
+    ipcSendToClient(
+        "coreIdentity", QString::fromLatin1(QJsonDocument(m_runtimeIdentity).toJson(QJsonDocument::Compact).toBase64())
+    );
     LOG_INFO("reloaded configuration");
   }
 }
@@ -106,6 +114,9 @@ void ServerApp::loadConfig()
     LOG_CRIT("%s: failed to load config: %s", qPrintable(processName()), path.toStdString().c_str());
     bye(s_exitConfig);
   }
+  ipcSendToClient(
+      "coreIdentity", QString::fromLatin1(QJsonDocument(m_runtimeIdentity).toJson(QJsonDocument::Compact).toBase64())
+  );
 }
 
 bool ServerApp::loadConfig(const QString &filename)
@@ -115,15 +126,20 @@ bool ServerApp::loadConfig(const QString &filename)
     // load configuration
     LOG_DEBUG("opening configuration \"%s\"", path.c_str());
 #if defined(Q_OS_WIN)
-    std::ifstream configStream(filename.toStdWString());
+    std::ifstream configStream(filename.toStdWString(), std::ios::binary);
 #else
-    std::ifstream configStream(path);
+    std::ifstream configStream(path, std::ios::binary);
 #endif
     if (!configStream.is_open()) {
       LOG_ERR("cannot open configuration \"%s\"", path.c_str());
       return false;
     }
-    configStream >> *m_config;
+    std::ostringstream raw;
+    raw << configStream.rdbuf();
+    if (configStream.bad())
+      return false;
+    const auto bytes = raw.str();
+    parseRuntimeConfig(*m_config, m_runtimeIdentity, bytes);
     LOG_DEBUG("configuration read successfully");
     return true;
   } catch (ServerConfigReadException &e) {
