@@ -152,6 +152,9 @@ if(WIN32 AND ENABLE_AUDIO_SHARING)
   add_executable(deskflow-ipc-stream-tests EXCLUDE_FROM_ALL ../audio/tests/IpcStreamTests.cpp)
   target_compile_options(deskflow-ipc-stream-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
   target_link_libraries(deskflow-ipc-stream-tests PRIVATE gui app)
+  add_executable(deskflow-ipc-peer-tests EXCLUDE_FROM_ALL ../audio/tests/IpcPeerTests.cpp)
+  target_link_libraries(deskflow-ipc-peer-tests PRIVATE Qt6::Network advapi32)
+  target_include_directories(deskflow-ipc-peer-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/lib)
   add_executable(deskflow-mute-protocol-tests EXCLUDE_FROM_ALL ../audio/tests/MuteWatchdogProtocolTests.cpp)
   target_compile_options(deskflow-mute-protocol-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
   target_link_libraries(deskflow-mute-protocol-tests PRIVATE ole32 uuid)
@@ -163,4 +166,5 @@ target_link_libraries(${target}
     platform
     net
     Qt6::Widgets
+    $<$<PLATFORM_ID:Windows>:advapi32>
 )

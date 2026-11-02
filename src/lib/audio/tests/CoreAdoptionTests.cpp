@@ -349,6 +349,37 @@ int main(int argc, char **argv)
       check(rejectedReplacement && !probe.isStarted() && replacement.stops == 0,
             "Changed core identity was adopted or stopped after reconnect");
     }
+    {
+      // Reproduce a normal (non-adopted) IPC connection whose status signals
+      // are queued just before a disconnect is delivered synchronously.
+      TestCore normal(name + QStringLiteral("-normal"));
+      TestDaemon normalDaemon(name + QStringLiteral("-normal-daemon"));
+      normal.listen();
+      normalDaemon.listen();
+      ServerConfig normalConfig;
+      CoreProcess probe(normalConfig, name + QStringLiteral("-normal"), QApplication::applicationFilePath(),
+                        name + QStringLiteral("-normal-daemon"));
+      probe.setMode(Settings::CoreMode::Client);
+      QStringList clients;
+      QString fingerprints;
+      QObject::connect(&probe, &CoreProcess::connectedClientsChanged, [&](const auto &value) { clients = value; });
+      QObject::connect(&probe, &CoreProcess::keyboardClientIdentitiesChanged,
+                       [&](const auto &value) { fingerprints = value; });
+      probe.start(Settings::ProcessMode::Service);
+      deskflow::gui::ipc::CoreIpcClient *ipc = nullptr;
+      check(waitFor([&] {
+        ipc = probe.findChild<deskflow::gui::ipc::CoreIpcClient *>();
+        return probe.isStarted() && ipc && ipc->isConnected();
+      }, 6000), "Normal core fixture did not connect");
+      Q_EMIT ipc->commandReceived(QStringLiteral("connectionState"), QStringLiteral("Connected"));
+      Q_EMIT ipc->commandReceived(QStringLiteral("connectedClients"), QStringLiteral("stale"));
+      Q_EMIT ipc->commandReceived(QStringLiteral("keyboardClientIdentities"), QStringLiteral("stale"));
+      Q_EMIT ipc->connectionFailed();
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+      check(probe.connectionState() == ConnectionState::Disconnected && clients.isEmpty() && fingerprints.isEmpty(),
+            "Queued old IPC status revived after disconnect");
+      probe.stop(Settings::ProcessMode::Service);
+    }
     TestCore server(name);
     TestDaemon daemon(name + QStringLiteral("-daemon"));
     server.listen();

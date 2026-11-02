@@ -7,6 +7,10 @@
 #include "IpcClient.h"
 
 #include "common/VersionInfo.h"
+#include "common/Constants.h"
+#include "WindowsIpcPeer.h"
+#include <QCoreApplication>
+#include <QDir>
 
 #include <QDebug>
 #include <QLocalSocket>
@@ -211,6 +215,19 @@ void IpcClient::handleConnectionFailure()
 
 void IpcClient::handleConnectionSuccess()
 {
+#ifdef Q_OS_WIN
+  // Production names are fixed; injected names are reserved for isolated tests.
+  const bool daemon = m_socketName == QLatin1String(kDaemonIpcName);
+  const bool core = m_socketName == QLatin1String(kCoreIpcName);
+  if ((daemon || core) && !detail::verifyPipeServer(
+          m_socket, daemon, QDir(QCoreApplication::applicationDirPath()).filePath(QLatin1String(kCoreBinName)))) {
+    qWarning().noquote() << QStringLiteral("%1 ipc server identity could not be verified").arg(m_typeName);
+    m_socket->abort();
+    m_state = State::Unconnected;
+    Q_EMIT connectionFailed();
+    return;
+  }
+#endif
   const auto versionId = QStringLiteral("%1+%2").arg(kVersion, kVersionGitSha);
   m_socket->write(QStringLiteral("hello=%1\n").arg(versionId).toUtf8());
   qDebug().noquote() << QStringLiteral("%1 ipc client sent hello with version: %2").arg(m_typeName, versionId);

@@ -721,17 +721,25 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
 
           m_coreIpcClient = new ipc::CoreIpcClient(this, m_coreIpcName);
 
-          // queued so a modal dialog opened by a handler can't block readyRead and strand later messages
-          connect(
-              m_coreIpcClient, &ipc::CoreIpcClient::commandReceived, this, &CoreProcess::onCoreIpcMessageReceived,
-              Qt::QueuedConnection
-          );
+          // Discard messages queued before a disconnect or a later start. A
+          // queued callback can otherwise restore an expired online identity.
+          const auto epoch = std::make_shared<std::uint64_t>(0);
+          const auto generation = m_operationGeneration;
+          connect(m_coreIpcClient, &ipc::CoreIpcClient::commandReceived, this,
+                  [this, client = m_coreIpcClient, epoch, generation](const QString &command, const QString &args) {
+            const auto receivedEpoch = *epoch;
+            QMetaObject::invokeMethod(this, [this, client, epoch, generation, receivedEpoch, command, args] {
+              if (m_coreIpcClient == client && m_operationGeneration == generation && *epoch == receivedEpoch)
+                onCoreIpcMessageReceived(command, args);
+            }, Qt::QueuedConnection);
+          });
           connect(m_coreIpcClient, &ipc::CoreIpcClient::connected, this, [] {
             qDebug("connected to core ipc server");
           });
-          connect(m_coreIpcClient, &ipc::CoreIpcClient::connectionFailed, this, [this, client = m_coreIpcClient] {
+          connect(m_coreIpcClient, &ipc::CoreIpcClient::connectionFailed, this, [this, client = m_coreIpcClient, epoch] {
             if (m_coreIpcClient != client)
               return;
+            ++*epoch;
             qWarning("core IPC disconnected; clearing online state and retrying");
             clearCoreStatus();
             QTimer::singleShot(kRetryDelay, this, [this, client] {
@@ -739,10 +747,11 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
                 client->connectToServer();
             });
           });
-          connect(m_coreIpcClient, &ipc::CoreIpcClient::serverShutdown, this, [this, client = m_coreIpcClient] {
+          connect(m_coreIpcClient, &ipc::CoreIpcClient::serverShutdown, this, [this, client = m_coreIpcClient, epoch] {
             qDebug("core ipc server shut down cleanly");
             if (m_coreIpcClient != client)
               return;
+            ++*epoch;
             clearCoreStatus();
             if (m_processState == ProcessState::Started) {
               QTimer::singleShot(kRetryDelay, this, [this, client] {

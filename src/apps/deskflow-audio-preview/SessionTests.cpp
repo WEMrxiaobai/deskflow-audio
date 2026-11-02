@@ -9,6 +9,7 @@
 #include <ws2tcpip.h>
 
 #include "Session.h"
+#include "audio/transport/SrtpTransport.h"
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -271,6 +272,99 @@ void missingFirstMedia()
   check(!connected && failed && !stop, "Missing first media reported connected or failed to trigger retry");
   check(std::chrono::steady_clock::now() - start < 2s, "Missing first media did not time out promptly");
 }
+void authenticatedUndecodableMedia()
+{
+  auto receiver = memoryReceiver();
+  receiver.firstMediaTimeout = 1200ms;
+  receiver.controlOwnsLifetime = true;
+  std::atomic<bool> stop{false};
+  std::promise<Offer> ready;
+  auto published = ready.get_future();
+  receiver.onReady = [&](const auto &value) { ready.set_value(Offer{value}); };
+  std::string failure, report;
+  bool connected = false;
+  auto worker = std::async(std::launch::async, [&] {
+    try {
+      preview::runSession(receiver, stop, [&](const auto &event) {
+        connected |= event.state == preview::SessionState::Connected;
+        if (event.message.find("received=") == 0)
+          report = event.message;
+      });
+    } catch (const std::exception &error) {
+      failure = error.what();
+    }
+  });
+  SOCKET socketHandle = INVALID_SOCKET;
+  try {
+    check(published.wait_for(2s) == std::future_status::ready, "Receiver did not publish an offer");
+    auto offer = published.get();
+    socketHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    check(socketHandle != INVALID_SOCKET, "Cannot create synthetic sender");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(offer.value.port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const auto nonce = preview::randomNonce();
+    const auto hello = preview::controlPacket(offer.value, preview::ControlType::Hello, nonce);
+    check(sendto(socketHandle, reinterpret_cast<const char *>(hello.data()), static_cast<int>(hello.size()), 0,
+                 reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == static_cast<int>(hello.size()),
+          "Cannot send Hello");
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(socketHandle, &readable);
+    timeval timeout{2, 0};
+    check(select(0, &readable, nullptr, nullptr, &timeout) == 1, "Receiver did not acknowledge Hello");
+    std::array<char, 128> ack{};
+    check(recv(socketHandle, ack.data(), static_cast<int>(ack.size()), 0) > 0, "Cannot read ACK");
+    auto material = preview::sessionMediaKey(offer.value, nonce);
+    deskflow::audio::transport::SrtpKey key(material);
+    deskflow::audio::transport::SrtpKey verificationKey(material);
+    SecureZeroMemory(material.data(), material.size());
+    deskflow::audio::transport::SrtpSender sender({offer.value.ssrc, 1, 48000, 2, 240}, std::move(key));
+    deskflow::audio::transport::SrtpReceiver verifier({offer.value.ssrc, 1, 48000, 2, 240}, std::move(verificationKey));
+    // Opus code 3 requires a second byte; this authenticated one-byte payload is invalid.
+    const std::array<std::uint8_t, 1> invalid{0x03};
+    std::uint16_t sequence = 0;
+    const auto limit = std::chrono::steady_clock::now() + 3s;
+    auto nextPacket = std::chrono::steady_clock::now();
+    while (worker.wait_for(0ms) != std::future_status::ready && std::chrono::steady_clock::now() < limit) {
+      while (std::chrono::steady_clock::now() < nextPacket)
+        std::this_thread::yield();
+      const auto packet = sender.protect(invalid, sequence, std::uint32_t(sequence) * 240);
+      check(bool(packet), "Cannot authenticate synthetic invalid Opus");
+      check(bool(verifier.unprotect(packet.packet)), "Synthetic packet did not pass SRTP authentication");
+      const auto sent = sendto(socketHandle, reinterpret_cast<const char *>(packet.packet.data()),
+                               static_cast<int>(packet.packet.size()), 0,
+                               reinterpret_cast<const sockaddr *>(&address), sizeof(address));
+      if (sent != static_cast<int>(packet.packet.size()) && worker.wait_for(20ms) == std::future_status::ready)
+        break; // Receiver closed its socket as the timeout fired.
+      check(sent == static_cast<int>(packet.packet.size()), "Cannot send invalid Opus");
+      ++sequence;
+      nextPacket += 5ms;
+    }
+    const bool finished = worker.wait_for(0ms) == std::future_status::ready;
+    if (!finished)
+      stop = true;
+    worker.get();
+    closesocket(socketHandle);
+    socketHandle = INVALID_SOCKET;
+    if (!finished || failure.find("首个可解码") == std::string::npos || connected || sequence == 0)
+      std::cerr << "Undecodable stream: finished=" << finished << " connected=" << connected
+                << " packets=" << sequence << " failure=" << failure << '\n';
+    check(finished && failure.find("首个可解码") != std::string::npos && !connected && sequence > 0,
+          "Undecodable authenticated stream did not hit the first-decode deadline");
+    check(report.find("received=") == 0 && report.find("received=0") != 0 &&
+              report.find("decoded=0") != std::string::npos,
+          "Receiver did not authenticate synthetic packets without decoding them");
+  } catch (...) {
+    stop = true;
+    if (socketHandle != INVALID_SOCKET)
+      closesocket(socketHandle);
+    if (worker.valid())
+      worker.get();
+    throw;
+  }
+}
 void memoryPair(bool ipv6 = false)
 {
   auto receiver = memoryReceiver();
@@ -334,6 +428,7 @@ int main()
     noOverlap();
     rejectsUnauthenticatedHello();
     missingFirstMedia();
+    authenticatedUndecodableMedia();
     memoryPair();
     memoryPair(true);
     std::cout << "Session tests passed: memory-only offers, validation, HMAC rejection, deadlines, callbacks, stop, "

@@ -231,7 +231,8 @@ struct PairedAudioGroup::Impl
             [this, worker, failure] {
               if (!current(worker))
                 return;
-              worker->status = QStringLiteral("正在重连");
+              worker->status = failure.isEmpty() ? QStringLiteral("正在重连")
+                                                 : QStringLiteral("%1 · 正在重连").arg(failure);
               Q_EMIT q->sourcesChanged();
               if (!worker->receive)
                 Q_EMIT q->statusChanged(QStringLiteral("%1 · 正在重连，本机播放设置保持不变").arg(failure));

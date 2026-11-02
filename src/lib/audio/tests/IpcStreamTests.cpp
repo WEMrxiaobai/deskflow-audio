@@ -73,12 +73,17 @@ int main(int argc, char **argv)
 #ifdef Q_OS_WIN
     using deskflow::core::ipc::detail::AccessServer;
     using deskflow::core::ipc::detail::allowSession;
-    check(allowSession(AccessServer::Core, 4, 4, false, false), "same-session core denied");
-    check(!allowSession(AccessServer::Core, 4, 5, true, false), "cross-session core allowed");
-    check(allowSession(AccessServer::Daemon, 0, 4, true, false), "active console/RDP denied");
-    check(!allowSession(AccessServer::Daemon, 0, 4, false, false), "inactive console/RDP allowed");
-    check(allowSession(AccessServer::Daemon, 0, 0, false, true), "LocalSystem denied");
-    check(!allowSession(AccessServer::Daemon, 0, 0, false, false), "non-system session zero allowed");
+    check(allowSession(AccessServer::Core, 4, 4, 0, false, false), "same-session core denied");
+    check(!allowSession(AccessServer::Core, 4, 5, 0, true, false), "cross-session core allowed");
+    check(allowSession(AccessServer::Daemon, 0, 4, 4, true, false), "managed console denied");
+    check(!allowSession(AccessServer::Daemon, 0, 5, 4, true, false), "other active RDP session allowed");
+    check(!allowSession(AccessServer::Daemon, 0, 4, 4, false, false), "inactive console allowed");
+    check(!allowSession(AccessServer::Daemon, 0, 4, 0xffffffffu, true, false), "missing console allowed");
+    check(allowSession(AccessServer::Daemon, 5, 5, 4, true, false), "foreground RDP daemon denied");
+    check(!allowSession(AccessServer::Daemon, 5, 4, 4, true, false), "other active session controls RDP daemon");
+    check(!allowSession(AccessServer::Daemon, 5, 5, 4, false, false), "inactive foreground session allowed");
+    check(allowSession(AccessServer::Daemon, 0, 0, 4, false, true), "LocalSystem denied");
+    check(!allowSession(AccessServer::Daemon, 0, 0, 4, false, false), "non-system session zero allowed");
 #endif
     const auto name = QStringLiteral("deskflow-ipc-stream-") + QUuid::createUuid().toString(QUuid::Id128);
 #ifdef Q_OS_WIN

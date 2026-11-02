@@ -93,7 +93,10 @@ void ServerApp::reloadConfig()
   LOG_DEBUG("reload configuration");
   if (loadConfig(Settings::serverConfigFile())) {
     if (m_server != nullptr) {
-      m_server->setConfig(*m_config);
+      if (!m_server->setConfig(*m_config)) {
+        LOG_ERR("failed to apply reloaded configuration");
+        return;
+      }
     }
     ipcSendToClient(
         "coreIdentity", QString::fromLatin1(QJsonDocument(m_runtimeIdentity).toJson(QJsonDocument::Compact).toBase64())
@@ -139,7 +142,13 @@ bool ServerApp::loadConfig(const QString &filename)
     if (configStream.bad())
       return false;
     const auto bytes = raw.str();
-    parseRuntimeConfig(*m_config, m_runtimeIdentity, bytes);
+    // Server::setConfig requires the current primary name. Validate before
+    // changing the shared live config or the identity advertised to the GUI.
+    const auto primary = m_server && m_primaryClient ? m_primaryClient->getName() : std::string();
+    if (!parseRuntimeConfig(*m_config, m_runtimeIdentity, bytes, primary)) {
+      LOG_ERR("configuration does not contain the primary computer");
+      return false;
+    }
     LOG_DEBUG("configuration read successfully");
     return true;
   } catch (ServerConfigReadException &e) {

@@ -55,6 +55,16 @@ void ServerConfigTests::runtimeLayoutReload()
   QVERIFY(failed);
   QVERIFY(config == lfConfig);
   QCOMPARE(identity, crlfIdentity);
+
+  // A parsed layout which lacks the running primary must leave both the
+  // shared configuration and its published identity untouched.
+  const auto liveConfig = config;
+  const auto liveIdentity = identity;
+  QVERIFY(!parseRuntimeConfig(config, identity, lf, "__missing_primary_test__"));
+  QVERIFY(config == liveConfig);
+  QCOMPARE(identity, liveIdentity);
+  QVERIFY(parseRuntimeConfig(config, identity, lf));
+  QVERIFY(identity.value("configHash") != liveIdentity.value("configHash"));
 }
 
 void ServerConfigTests::equalityCheck()

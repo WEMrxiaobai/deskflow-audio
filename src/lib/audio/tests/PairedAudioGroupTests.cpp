@@ -28,6 +28,7 @@
 #include <stdexcept>
 
 void failGroupReceiver(std::size_t slot);
+void failGroupDevice(std::size_t slot);
 void failGroupRestore(int error);
 
 namespace {
@@ -240,7 +241,8 @@ void exercise(const QTemporaryDir &temporary, bool render)
       waitFor([&] {
         for (const auto &source : hub.group->sources())
           if (source.id == alphaId)
-            return source.status == QStringLiteral("正在重连");
+            return source.status.contains(QStringLiteral("UDP receive failed")) &&
+                   source.status.contains(QStringLiteral("正在重连"));
         return false;
       }),
       "Injected source failure did not enter retry"
@@ -253,6 +255,16 @@ void exercise(const QTemporaryDir &temporary, bool render)
           hub.control->peerIds().size() == 2,
       "Media-only retry restarted the healthy source/output or lost its TLS pairing"
   );
+  failGroupDevice(resumedAlpha->playbackSlot);
+  check(waitFor([&] {
+    for (const auto &source : hub.group->sources())
+      if (source.id == alphaId)
+        return source.status.contains(QStringLiteral("Unsupported audio device layout")) &&
+               source.status.contains(QStringLiteral("正在重连"));
+    return false;
+  }), "Receiver device failure was not visible in the source status");
+  check(waitFor([&] { return receiving(hub, 2); }) && sourceControl(hub, betaId) == stableBeta,
+        "Receiver did not recover after the isolated device error");
   alpha.control->configure(false, false, {});
   check(
       waitFor([&] { return receiving(hub, 1) && hub.group->sources()[0].id == betaId; }),

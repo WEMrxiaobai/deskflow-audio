@@ -14,11 +14,19 @@ enum class AccessServer { Core, Daemon };
 
 // Pure policy, kept separate from OS queries so failures, console and RDP
 // sessions can be exercised without changing the user's logged-in sessions.
-inline bool allowSession(AccessServer server, DWORD serverSession, DWORD clientSession, bool active, bool localSystem)
+inline bool allowSession(
+    AccessServer server, DWORD serverSession, DWORD clientSession, DWORD consoleSession, bool active, bool localSystem
+)
 {
   if (server == AccessServer::Core)
     return serverSession == clientSession;
-  return active || (clientSession == 0 && localSystem);
+  if (clientSession == 0)
+    return localSystem;
+  // The SYSTEM daemon's watchdog launches the core in the physical console
+  // session. A foreground daemon instead launches in its own session, which
+  // also permits a foreground daemon and GUI inside an active RDP session.
+  const DWORD managedSession = serverSession == 0 ? consoleSession : serverSession;
+  return managedSession != 0 && managedSession != 0xffffffffu && clientSession == managedSession && active;
 }
 
 inline bool clientIsLocalSystem(DWORD pid)
@@ -48,9 +56,9 @@ inline bool authorizePipe(QLocalSocket *socket, AccessServer server)
       !ProcessIdToSessionId(GetCurrentProcessId(), &serverSession))
     return false;
   if (server == AccessServer::Core)
-    return allowSession(server, serverSession, clientSession, false, false);
+    return allowSession(server, serverSession, clientSession, 0, false, false);
   if (clientSession == 0)
-    return allowSession(server, serverSession, clientSession, false, clientIsLocalSystem(pid));
+    return allowSession(server, serverSession, clientSession, 0, false, clientIsLocalSystem(pid));
   LPWSTR info = nullptr;
   DWORD bytes = 0;
   const bool queried = WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, clientSession, WTSConnectState, &info, &bytes);
@@ -58,7 +66,8 @@ inline bool authorizePipe(QLocalSocket *socket, AccessServer server)
                       *reinterpret_cast<WTS_CONNECTSTATE_CLASS *>(info) == WTSActive;
   if (info)
     WTSFreeMemory(info);
-  return allowSession(server, serverSession, clientSession, active, false);
+  const DWORD consoleSession = serverSession == 0 ? WTSGetActiveConsoleSessionId() : 0;
+  return allowSession(server, serverSession, clientSession, consoleSession, active, false);
 }
 } // namespace deskflow::core::ipc::detail
 #endif

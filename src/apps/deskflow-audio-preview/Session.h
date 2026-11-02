@@ -100,7 +100,7 @@ struct SessionOptions
   std::function<void(const Invitation &)> onReady;
   // Applies to both roles, independently of the offer's credential expiry.
   std::chrono::milliseconds handshakeTimeout{10000};
-  // Receiver waits this long after acknowledging the handshake for authenticated media.
+  // Receiver waits this long after acknowledging the handshake for successfully decoded media.
   std::chrono::milliseconds firstMediaTimeout{10000};
 };
 using SessionObserver = std::function<void(const SessionEvent &)>;

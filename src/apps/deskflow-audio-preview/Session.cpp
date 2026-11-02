@@ -599,11 +599,11 @@ void runInternal(
         receiver->setMuted(options.playbackControl->muted.load());
       }
       receiver->tick(now);
-      if (receiver->stats().authenticatedPackets == 0 &&
+      if (receiver->stats().decodedPackets == 0 &&
           now - start >= static_cast<std::uint64_t>(
                              std::chrono::duration_cast<std::chrono::nanoseconds>(options.firstMediaTimeout).count()
                          ))
-        throw std::runtime_error("等待首个音频数据包超时，需要重新建立会话");
+        throw std::runtime_error("等待首个可解码音频数据包超时，需要重新建立会话");
       if (test && !testRender && !options.sharedPlayback && now >= nextRender) {
         (void)receiver->render(discard);
         for (float sample : discard)

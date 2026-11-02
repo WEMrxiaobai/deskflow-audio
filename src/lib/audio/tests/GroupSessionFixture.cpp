@@ -4,13 +4,18 @@
 #include "../../../apps/deskflow-audio-preview/Session.h"
 #include <windows.h>
 #include <winsock2.h>
+#include <stdexcept>
 namespace {
 std::atomic<int> failingSlot{-1};
+std::atomic<int> failingDeviceSlot{-1};
 std::atomic<int> failedRestore{0};
 thread_local int receivingSlot = -1;
 int fixtureRecvFrom(SOCKET socket, char *buffer, int length, int flags, sockaddr *from, int *fromLength)
 {
   int expected = receivingSlot;
+  if (expected >= 0 && failingDeviceSlot.compare_exchange_strong(expected, -1))
+    throw std::runtime_error("Unsupported audio device layout");
+  expected = receivingSlot;
   if (expected >= 0 && failingSlot.compare_exchange_strong(expected, -1)) {
     WSASetLastError(WSAENETDOWN);
     return SOCKET_ERROR;
@@ -21,6 +26,10 @@ int fixtureRecvFrom(SOCKET socket, char *buffer, int length, int flags, sockaddr
 void failGroupReceiver(std::size_t slot)
 {
   failingSlot = static_cast<int>(slot);
+}
+void failGroupDevice(std::size_t slot)
+{
+  failingDeviceSlot = static_cast<int>(slot);
 }
 void failGroupRestore(int error)
 {
