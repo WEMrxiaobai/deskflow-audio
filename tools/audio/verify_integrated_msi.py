@@ -26,10 +26,24 @@ files=rows('File');names={row[2].split('|')[-1] for row in files}
 required={'deskflow-audio-mute-watchdog.exe','deskflow.exe','deskflow-core.exe','deskflow-daemon.exe','Qt6Core.dll','Qt6Widgets.dll','Qt6Gui.dll','Qt6Network.dll','Qt6Svg.dll','libssl-3-x64.dll','libcrypto-3-x64.dll','qwindows.dll','qopensslbackend.dll','deskflow_zh_CN.qm','vcruntime140.dll','msvcp140.dll'}
 assert required<=names,required-names
 assert not any(name.endswith('.cmd') for name in names),'Main product must not launch through preview CMD scripts'
-shortcuts=rows('Shortcut');assert any(row[4]=='[INSTALLFOLDER]deskflow.exe' for row in shortcuts)
+shortcuts=rows('Shortcut');shortcut_map={row[0]:row for row in shortcuts}
+for shortcut_id,directory_id in [('DeskflowGuiShortcut','DeskflowMenuFolder'),
+                                 ('DeskflowDesktopGuiShortcut','DesktopFolder')]:
+    shortcut=shortcut_map[shortcut_id]
+    assert shortcut[1]==directory_id and shortcut[4]=='[INSTALLFOLDER]deskflow.exe' and shortcut[11]=='INSTALLFOLDER', \
+        'Incorrect GUI shortcut: '+shortcut_id
 assert len(rows('Dialog'))>=20
 services=rows('ServiceInstall');assert any(row[1]=='Deskflow' for row in services)
 firewall=rows('WixFirewallException');assert len(firewall)==3
+rules={row[0]:row for row in firewall}
+core_file=next(row for row in files if row[2].split('|')[-1]=='deskflow-core.exe')
+core=rules['DeskflowCorePrivateTcp']
+assert core[2:5]==['LocalSubnet','','6'], 'Core TCP rule must cover configured ports in the local subnet'
+assert core[5]=='[#'+core_file[0]+']' and core[7]=='2' and core[8]==core_file[1], \
+    'Core rule must be bound to its executable component and the Private profile'
+for rule in firewall:
+    assert rule[2]=='LocalSubnet' and rule[7]=='2', 'All rules must stay Private/localSubnet'
+
 properties=dict((row[0],row[1]) for row in rows('Property'))
 print(json.dumps({'product':properties['ProductName'],'version':properties['ProductVersion'],'files':len(files),'shortcuts':len(shortcuts),'services':len(services),'firewall_rules':len(firewall),'sha256':hashlib.sha256(args.msi.read_bytes()).hexdigest()},ensure_ascii=True,indent=2))
 # Verify actual compressed executable bytes, not only the File table entries.

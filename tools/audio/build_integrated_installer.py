@@ -165,7 +165,7 @@ def build(args) -> Path:
         "从开始菜单 Deskflow 启动桌面界面。键鼠配对后音频直接可用，无需单独授权或邀请文件。\n"
         "这是未签名开发构建，不是正式 Deskflow 发布，不保证物理延迟或跨机长期稳定性。\n"
         "安装会升级同系列的旧 Deskflow、配置并启动原 Deskflow 服务；可能中断当前键鼠连接。\n"
-        "仅为专用网络/本地子网添加键鼠 TCP24800、音频控制 TCP24801 与音频 UDP 防火墙例外。\n"
+        "仅为专用网络/本地子网添加键鼠程序 TCP、音频控制 TCP24801 与音频 UDP 防火墙例外。\n"
         "在插耳机的电脑勾选“在本机收听其他电脑”，已配对的对端自动发送声音；关闭开关停止音频。\n"
         "发送端新增“共享时本机也播放”，默认关闭并记住；共享成功后临时静音本机，停止后恢复。\n"
         "音频开关会记住；键鼠重连后自动恢复。不采麦克风、不录音、不修改系统音量数值。\n"
@@ -203,6 +203,7 @@ def build(args) -> Path:
     install = element(program_files, "Directory", Id="INSTALLFOLDER", Name="Deskflow")
     menu = element(element(root, "Directory", Id="ProgramMenuFolder"), "Directory",
                    Id="DeskflowMenuFolder", Name="Deskflow")
+    desktop = element(root, "Directory", Id="DesktopFolder")
     directories = {"": install}
 
     def directory(relative: str):
@@ -237,8 +238,8 @@ def build(args) -> Path:
                               Name="Deskflow Keyboard Mouse (Private LAN)" if is_core else "Deskflow Audio Development (Private LAN)",
                               File=file_id, Protocol="tcp" if is_core else "udp", Scope="localSubnet", Profile="private",
                               Description="Private profile and local subnet only; removed when Deskflow is uninstalled.")
-            if is_core:
-                attributes["Port"] = "24800"
+            # Program-scoped TCP permits Deskflow's configured core port,
+            # including non-default ports; Private/localSubnet remains required.
             element(component, "FirewallException", namespace=FIREWALL, **attributes)
             if not is_core:
                 element(component, "FirewallException", namespace=FIREWALL,
@@ -256,6 +257,14 @@ def build(args) -> Path:
             Target="[INSTALLFOLDER]docs\\AudioDevelopment.txt", WorkingDirectory="INSTALLFOLDER")
     element(shortcuts, "RemoveFolder", Id="RemoveDeskflowMenu", On="uninstall")
     element(feature, "ComponentRef", Id="DeskflowMenuShortcuts")
+    desktop_shortcut = element(desktop, "Component", Id="DeskflowDesktopShortcut",
+                               Guid="975B4419-6E35-4F96-89B3-127D95A9B527", Win64="yes")
+    element(desktop_shortcut, "RegistryValue", Root="HKLM", Key="Software\\Deskflow\\AudioDevelopment",
+            Name="DesktopShortcutInstalled", Type="integer", Value="1", KeyPath="yes")
+    element(desktop_shortcut, "Shortcut", Id="DeskflowDesktopGuiShortcut", Name="Deskflow",
+            Target="[INSTALLFOLDER]deskflow.exe", WorkingDirectory="INSTALLFOLDER",
+            Description="Deskflow桌面界面（含实验性音频共享）")
+    element(feature, "ComponentRef", Id="DeskflowDesktopShortcut")
     # Prompt before asking a running GUI to close; never forcibly terminate it.
     close = element(product, "CloseApplication", namespace=UTIL, Id="CloseDeskflowGui", Target="deskflow.exe",
                     PromptToContinue="yes", Description="安装需要关闭正在运行的 Deskflow。请先保存工作并退出，然后重试。",
