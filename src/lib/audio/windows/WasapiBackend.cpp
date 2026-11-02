@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
 #include "WasapiBackend.h"
 #include "WasapiPcm.h"
+#include "DeviceNotificationFilter.h"
 
 #include <audioclient.h>
 #include <avrt.h>
@@ -104,9 +105,10 @@ private:
 class DeviceNotifications final : public IMMNotificationClient
 {
 public:
-  explicit DeviceNotifications(HANDLE restart) noexcept : m_restart(restart)
+  explicit DeviceNotifications(HANDLE restart, bool followsDefault) noexcept : m_restart(restart), m_filter(followsDefault)
   {
   }
+  void setEndpoint(const wchar_t *id) { m_filter.setEndpoint(id); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
   {
     if (!out)
@@ -132,29 +134,31 @@ public:
   }
   HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override
   {
-    if (flow == eRender && role == eConsole)
+    if (m_filter.defaultChanged(flow == eRender, role == eConsole))
       signal();
     return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override
+  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD) override
   {
-    signal();
+    if (m_filter.endpointChanged(id))
+      signal();
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override
   {
-    signal();
     return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override
+  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override
   {
-    signal();
+    if (m_filter.endpointChanged(id))
+      signal();
     return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY key) override
+  HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR id, const PROPERTYKEY key) override
   {
     // In particular do NOT restart on volume changes or friendly-name edits.
-    if (IsEqualPropertyKey(key, PKEY_AudioEngine_DeviceFormat) || IsEqualPropertyKey(key, PKEY_AudioEngine_OEMFormat))
+    if (m_filter.endpointChanged(id) &&
+        (IsEqualPropertyKey(key, PKEY_AudioEngine_DeviceFormat) || IsEqualPropertyKey(key, PKEY_AudioEngine_OEMFormat)))
       signal();
     return S_OK;
   }
@@ -166,6 +170,7 @@ private:
   }
   std::atomic<ULONG> m_refs{1};
   Event m_restart;
+  detail::DeviceNotificationFilter m_filter;
 };
 
 struct NotificationRegistration final
@@ -179,7 +184,7 @@ struct NotificationRegistration final
       enumerator->UnregisterEndpointNotificationCallback(callback.Get());
     // COM smart pointers release before the worker's ComApartment is destroyed.
   }
-  HRESULT initialize(HANDLE restart) noexcept
+  HRESULT initialize(HANDLE restart, bool followsDefault) noexcept
   {
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
     if (FAILED(hr))
@@ -189,7 +194,7 @@ struct NotificationRegistration final
             GetCurrentProcess(), restart, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS
         ))
       return HRESULT_FROM_WIN32(GetLastError());
-    auto *sink = new (std::nothrow) DeviceNotifications(duplicate);
+    auto *sink = new (std::nothrow) DeviceNotifications(duplicate, followsDefault);
     if (!sink) {
       CloseHandle(duplicate);
       return E_OUTOFMEMORY;
@@ -255,12 +260,20 @@ struct Stream final
     );
   }
 
-  HRESULT open(IMMDeviceEnumerator *enumerator, Direction direction, const std::wstring &endpointId)
+  HRESULT open(IMMDeviceEnumerator *enumerator, DeviceNotifications *notifications, Direction direction, const std::wstring &endpointId)
   {
     HRESULT hr = endpointId.empty() ? enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)
                                     : enumerator->GetDevice(endpointId.c_str(), &device);
     if (FAILED(hr))
       return hr;
+    LPWSTR id = nullptr;
+    if (FAILED(hr = device->GetId(&id)))
+      return hr;
+    const auto freeId = [](wchar_t *value) { CoTaskMemFree(value); };
+    std::unique_ptr<wchar_t, decltype(freeId)> selectedId(id, freeId);
+    if (!id)
+      return E_FAIL;
+    notifications->setEndpoint(id);
     if (FAILED(hr = activate()))
       return hr;
 
@@ -332,6 +345,8 @@ struct Stream final
     scratch.resize(samples);
     const auto halfBufferMs = static_cast<std::uint64_t>(format.bufferFrames) * 500 / format.sampleRate;
     pollMs = static_cast<DWORD>(std::clamp<std::uint64_t>(halfBufferMs, 1, 10));
+    if (direction == Direction::Render)
+      pollMs = std::min<DWORD>(pollMs, 5);
     if (direction == Direction::LoopbackCapture) {
       if (FAILED(hr = client->GetService(IID_PPV_ARGS(&capture))))
         return hr;
@@ -424,7 +439,10 @@ struct Stream final
       return hr;
     if (padding > format.bufferFrames)
       return AUDCLNT_E_BUFFER_SIZE_ERROR;
-    const UINT32 frames = format.bufferFrames - padding;
+    // Do not hand a delayed wakeup's entire free buffer to the receiver. One
+    // callback per wake preserves its bounded quantum; timeouts refill any
+    // remaining space even when the driver does not issue another event.
+    const UINT32 frames = detail::renderQuantum(format.bufferFrames - padding, format.sampleRate);
     if (!frames)
       return S_OK;
     const auto count = static_cast<std::size_t>(frames) * format.channels;
@@ -529,7 +547,7 @@ struct WasapiBackend::Impl final
       return;
     }
     NotificationRegistration notifications;
-    HRESULT hr = notifications.initialize(restartEvent.get());
+    HRESULT hr = notifications.initialize(restartEvent.get(), endpointId.empty());
     if (FAILED(hr)) {
       // Without notifications default tracking is not guaranteed; do not
       // silently leave a stream attached to a stale default endpoint.
@@ -541,7 +559,7 @@ struct WasapiBackend::Impl final
       DeviceFormat lastFormat{};
       {
         Stream stream;
-        hr = stream.open(notifications.enumerator.Get(), direction, endpointId);
+        hr = stream.open(notifications.enumerator.Get(), notifications.callback.Get(), direction, endpointId);
         if (SUCCEEDED(hr) && !stopping() && WaitForSingleObject(restartEvent.get(), 0) != WAIT_OBJECT_0) {
           stream.format.generation = ++generation;
           lastFormat = stream.format;

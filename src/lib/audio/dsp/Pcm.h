@@ -29,6 +29,8 @@ struct PcmFormat
 {
   std::uint32_t sampleRate = 48000;
   std::uint32_t channels = 2;
+  // Windows speaker bit order; zero is permitted only where layout is unambiguous.
+  std::uint32_t channelMask = 0;
 
   [[nodiscard]] bool valid() const noexcept
   {

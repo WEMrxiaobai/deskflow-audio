@@ -358,7 +358,7 @@ struct AudioReceiver::Impl
         networkClock(durationNs),
         adapter(kMediaFormat, device),
         playback(
-            device, device.framesForDuration(30),
+            device, (std::size_t(device.sampleRate) * 30 + 999) / 1000,
             std::max(std::size_t(1), (std::size_t(device.sampleRate) * 5 + 999) / 1000), opts.initialVolume
         ),
         drift(
@@ -470,7 +470,7 @@ struct AudioReceiver::Impl
     auto input = std::span<const float>(pcm.data(), std::size_t(config.frameSamples) * 2);
     bool first = true;
     for (;;) {
-      const auto progress = adapter.process(input, adapted);
+      const auto progress = adapter.process(input, std::span(adapted).first(adapted.size() / device.channels * device.channels));
       input = input.subspan(progress.inputFrames * 2);
       if (progress.outputFrames != 0) {
         const auto block = std::span<const float>(adapted.data(), progress.outputFrames * device.channels);
@@ -682,7 +682,7 @@ bool AudioReceiver::render(std::span<float> output, std::uint64_t callbackNs) no
   const auto missing = m_impl->playback.stats().underrunFrames - before;
   m_impl->playbackClock.end(
       missing == 0 && !discontinuity ? nowNs : 0,
-      output.size() / m_impl->device.channels - static_cast<std::size_t>(missing)
+      output.size() / m_impl->device.channels - static_cast<std::size_t>(missing), m_impl->device.sampleRate
   );
   return result;
 }
@@ -745,7 +745,7 @@ bool AudioReceiver::mix(std::span<AudioReceiver *const> sources, std::span<float
     const auto missing = active[i]->m_impl->playback.stats().underrunFrames - underruns[i];
     active[i]->m_impl->playbackClock.end(
         missing == 0 && !discontinuities[i] ? nowNs : 0,
-        output.size() / format.channels - static_cast<std::size_t>(missing)
+        output.size() / format.channels - static_cast<std::size_t>(missing), format.sampleRate
     );
   }
   return result;

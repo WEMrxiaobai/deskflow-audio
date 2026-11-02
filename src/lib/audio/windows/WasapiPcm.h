@@ -23,6 +23,12 @@
 
 namespace deskflow::audio::windows::detail {
 
+// A single callback must fit the receiver's phase-normalized 10 ms model.
+inline std::uint32_t renderQuantum(std::uint32_t available, std::uint32_t sampleRate) noexcept
+{
+  return std::min(available, (sampleRate + 99u) / 100u);
+}
+
 enum class SampleType
 {
   Float32,

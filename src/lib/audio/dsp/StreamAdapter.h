@@ -17,6 +17,57 @@ struct AdapterProgress
   bool valid = true;
 };
 
+// Windows WAVEFORMATEXTENSIBLE order, independent of Windows headers. Only
+// layouts with an unambiguous mapping are accepted. Downmix includes center,
+// LFE, back and side channels with fixed headroom for fully correlated signals.
+inline bool supportedChannelLayout(PcmFormat f) noexcept
+{
+  if (f.channels == 1)
+    return f.channelMask == 0 || f.channelMask == 0x4;
+  if (f.channels == 2)
+    return f.channelMask == 0 || f.channelMask == 0x3;
+  return (f.channels == 6 && (f.channelMask == 0x3f || f.channelMask == 0x60f)) ||
+         (f.channels == 8 && f.channelMask == 0x63f);
+}
+inline std::array<float, 2> stereoFrame(PcmFormat f, const float *samples) noexcept
+{
+  const auto left = finiteSample(samples[0]);
+  if (f.channels == 1)
+    return {left, left};
+  if (f.channels == 2)
+    return {left, finiteSample(samples[1])};
+  constexpr double surround = 0.7071067811865476;
+  const double scale = 1.0 / (1.0 + surround + 0.5 + surround * (f.channels == 8 ? 2.0 : 1.0));
+  double l = 0, r = 0;
+  unsigned index = 0;
+  for (unsigned bit = 0; bit < 32; ++bit) {
+    if (!(f.channelMask & (std::uint32_t(1) << bit)))
+      continue;
+    const auto sample = double(finiteSample(samples[index++]));
+    switch (bit) {
+    case 0: l += sample; break; // front left
+    case 1: r += sample; break; // front right
+    case 2: l += sample * surround; r += sample * surround; break; // center
+    case 3: l += sample * 0.5; r += sample * 0.5; break; // LFE
+    case 4: case 9: l += sample * surround; break; // back/side left
+    case 5: case 10: r += sample * surround; break; // back/side right
+    }
+  }
+  return {float(l * scale), float(r * scale)};
+}
+inline void writeStereoFrame(PcmFormat f, const std::array<float, 2> &stereo, float *output) noexcept
+{
+  if (f.channels == 1) {
+    output[0] = float((double(stereo[0]) + double(stereo[1])) * 0.5);
+    return;
+  }
+  output[0] = stereo[0];
+  output[1] = stereo[1];
+  // Stereo is rendered on the physical front L/R speakers; other speakers
+  // are silent, avoiding invented center, surround or unfiltered LFE content.
+  std::fill(output + 2, output + f.channels, 0.0f);
+}
+
 // Allocation-free streaming linear interpolation baseline, NOT a band-limited/music-quality
 // resampler. Downsampling requires externally band-limited input to avoid aliasing. Explicit
 // support: interleaved f32, 8..192 kHz, mono/stereo. Mono->stereo duplicates; stereo->mono
@@ -30,7 +81,7 @@ public:
   StreamAdapter(PcmFormat input, PcmFormat output) : m_input(input), m_output(output)
   {
     if (!supported(input) || !supported(output)) {
-      throw std::invalid_argument("StreamAdapter supports 8..192kHz mono/stereo f32 only");
+      throw std::invalid_argument("Unsupported audio format: use 8..192kHz mono/stereo or a standard 5.1/7.1 speaker layout with channel mask");
     }
     m_denominator = std::uint64_t(output.sampleRate) * 1000000000ULL;
     (void)setRateCorrectionPpm(0);
@@ -38,7 +89,7 @@ public:
 
   [[nodiscard]] static bool supported(PcmFormat format) noexcept
   {
-    return format.sampleRate >= 8000 && format.sampleRate <= 192000 && (format.channels == 1 || format.channels == 2);
+    return format.sampleRate >= 8000 && format.sampleRate <= 192000 && supportedChannelLayout(format);
   }
   // Positive ppm consumes input faster (e.g. a high receive-buffer water level).
   // Range +/-5000 ppm, quantized to .001 ppm; returns false and preserves state for invalid input.
@@ -83,14 +134,7 @@ public:
         return false;
       }
       const auto offset = result.inputFrames++ * m_input.channels;
-      const auto left = finiteSample(input[offset]);
-      const auto right = m_input.channels == 2 ? finiteSample(input[offset + 1]) : left;
-      if (m_output.channels == 1) {
-        frame[0] = static_cast<float>((double(left) + double(right)) * 0.5);
-      } else {
-        frame[0] = left;
-        frame[1] = right;
-      }
+      frame = stereoFrame(m_input, input.data() + offset);
       return true;
     };
     while (result.outputFrames < outputFrames) {
@@ -116,12 +160,14 @@ public:
         m_haveRight = true;
       }
       const double fraction = double(m_phase) / double(m_denominator);
-      for (std::size_t channel = 0; channel < m_output.channels; ++channel) {
+      std::array<float, 2> frame{};
+      for (std::size_t channel = 0; channel < 2; ++channel) {
         const auto value = m_phase == 0
                                ? double(m_left[channel])
                                : double(m_left[channel]) * (1.0 - fraction) + double(m_right[channel]) * fraction;
-        output[result.outputFrames * m_output.channels + channel] = static_cast<float>(value);
+        frame[channel] = static_cast<float>(value);
       }
+      writeStereoFrame(m_output, frame, output.data() + result.outputFrames * m_output.channels);
       ++result.outputFrames;
       m_phase += m_step;
     }

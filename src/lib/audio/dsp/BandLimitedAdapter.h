@@ -35,7 +35,7 @@ public:
   BandLimitedAdapter(PcmFormat input, PcmFormat output) : m_input(input), m_output(output)
   {
     if (!supported(input) || !supported(output)) {
-      throw std::invalid_argument("BandLimitedAdapter supports 8..192kHz mono/stereo f32 only");
+      throw std::invalid_argument("Unsupported audio format: use 8..192kHz mono/stereo or a standard 5.1/7.1 speaker layout with channel mask");
     }
     const double ratio = double(input.sampleRate) / output.sampleRate;
     m_taps = static_cast<std::size_t>(std::ceil(64.0 * std::max(1.0, ratio)));
@@ -125,11 +125,7 @@ public:
           return result;
         }
         const auto offset = result.inputFrames++ * m_input.channels;
-        const auto left = finiteSample(input[offset]);
-        const auto right = m_input.channels == 2 ? finiteSample(input[offset + 1]) : left;
-        m_history[m_write] = m_output.channels == 1
-                                 ? std::array<float, 2>{static_cast<float>((double(left) + double(right)) * 0.5), 0.0f}
-                                 : std::array<float, 2>{left, right};
+        m_history[m_write] = stereoFrame(m_input, input.data() + offset);
         if (++m_write == m_taps) {
           m_write = 0;
         }
@@ -146,16 +142,15 @@ public:
       auto index = m_write; // oldest retained input frame
       for (std::size_t tap = 0; tap < m_taps; ++tap) {
         const double coefficient = double(first[tap]) + fraction * (double(second[tap]) - double(first[tap]));
-        for (std::size_t channel = 0; channel < m_output.channels; ++channel) {
+        for (std::size_t channel = 0; channel < 2; ++channel) {
           sum[channel] += coefficient * double(m_history[index][channel]);
         }
         if (++index == m_taps) {
           index = 0;
         }
       }
-      for (std::size_t channel = 0; channel < m_output.channels; ++channel) {
-        output[result.outputFrames * m_output.channels + channel] = static_cast<float>(sum[channel]);
-      }
+      const std::array<float, 2> frame{float(sum[0]), float(sum[1])};
+      writeStereoFrame(m_output, frame, output.data() + result.outputFrames * m_output.channels);
       ++result.outputFrames;
       m_phase += m_step;
       m_pending = static_cast<std::size_t>(m_phase / m_denominator);
