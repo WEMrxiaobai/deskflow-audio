@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <windows.h>
 
@@ -37,8 +38,15 @@ int main()
   std::filesystem::path path;
   preview::Invitation invite;
   try {
-    invite = preview::createInvitation(24818, {"127.0.0.1", "192.168.1.20"});
+    invite = preview::createInvitation(24818, {"127.0.0.1", "192.168.1.20", "::1", "fd00::1234"});
     check(invite.expiresUnixSeconds >= preview::unixSeconds() + 598, "Invitation expiration is wrong");
+    constexpr std::uint64_t now = 10000;
+    check(preview::validInvitationExpiry(now + 600 + 120, now), "Receiver clock ahead was rejected");
+    check(!preview::validInvitationExpiry(now + 600 + 121, now), "Excessive future clock skew was accepted");
+    check(preview::validInvitationExpiry(now - 120, now), "Sender clock ahead was rejected");
+    check(!preview::validInvitationExpiry(now - 121, now), "Expired invitation exceeded clock skew allowance");
+    check(!preview::validInvitationExpiry(std::numeric_limits<std::uint64_t>::max(), now), "Expiry overflow accepted");
+    check(!preview::validInvitationExpiry(0, now), "Ancient invitation accepted");
     const auto nonce = preview::randomNonce();
     path = std::filesystem::temp_directory_path() /
            ("deskflow-audio-invitation-test-" + std::to_string(GetCurrentProcessId()) + "-" +
@@ -101,7 +109,8 @@ int main()
     SecureZeroMemory(repeated.data(), repeated.size());
     SecureZeroMemory(different.data(), different.size());
     for (const auto *address :
-         {"0.0.0.0", "255.255.255.255", "224.0.0.1", "239.1.2.3", "127.1", "127.00.0.1", "1.2.3.4\n"})
+         {"0.0.0.0", "255.255.255.255", "224.0.0.1", "239.1.2.3", "127.1", "127.00.0.1", "1.2.3.4\n",
+          "::", "ff02::1", "fe80::1", "fe80::1%1", "::ffff:127.0.0.1"})
       rejects([&] {
         auto invalid = preview::createInvitation(24818, {address});
         preview::erase(invalid);
@@ -115,7 +124,7 @@ int main()
       preview::erase(invalid);
     });
     auto expired = invite;
-    expired.expiresUnixSeconds = preview::unixSeconds() - 1;
+    expired.expiresUnixSeconds = preview::unixSeconds() - 121;
     rejects([&] { (void)preview::controlPacket(expired, preview::ControlType::Hello, nonce); });
     preview::erase(expired);
     auto shortLived = invite;
@@ -124,10 +133,8 @@ int main()
     Sleep(2100);
     preview::ControlType stopType{};
     preview::Nonce stopNonce{};
-    check(
-        !preview::verifyControl(shortLived, establishedStop, stopType, stopNonce),
-        "Expired invitation allowed a new handshake"
-    );
+    check(preview::verifyControl(shortLived, establishedStop, stopType, stopNonce),
+          "Invitation inside clock skew allowance failed authentication");
     check(
         preview::verifyControl(shortLived, establishedStop, stopType, stopNonce, false) &&
             stopType == preview::ControlType::Stop && stopNonce == nonce,

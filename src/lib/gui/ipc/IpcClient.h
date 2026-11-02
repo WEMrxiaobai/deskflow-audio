@@ -64,7 +64,6 @@ private:
   QLocalSocket *m_socket;
   State m_state{State::Unconnected};
   QString m_socketName;
-  QByteArray m_readBuffer;
   int m_retryCount{0};
   QString m_typeName;
 };

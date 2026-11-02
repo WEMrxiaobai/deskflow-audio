@@ -45,6 +45,8 @@ private:
   void
   startSession(const QString &peer, bool receive, const QString &session, const preview::Invitation *offer = nullptr);
   void stopSession(bool inform = true, bool retry = false);
+  void releaseLocalOutput();
+  void showRestoreWarning();
   bool shouldReceive(const QString &peer) const;
   bool shouldSend(const QString &peer) const;
   void refreshSources();
@@ -52,6 +54,7 @@ private:
   QCheckBox *m_localPlayback;
   QPushButton *m_stop;
   QLabel *m_status;
+  QLabel *m_restoreWarning;
   PairedAudioControl *m_control;
   PairedAudioGroup *m_group;
   struct SourceRow
@@ -68,6 +71,9 @@ private:
   QHash<QString, bool> m_remoteListen;
   QHash<QString, bool> m_remoteAvailable;
   QStringList m_connectedNames;
+  QHash<QString, QString> m_connectedIdentities;
+  QString m_connectedServerAddress;
+  QString m_keyboardServerFingerprint;
   QString m_activePeer, m_session;
   bool m_receive = false, m_running = false, m_destroying = false, m_senderPaused = false;
   bool m_localPlaybackOverridden = false;

@@ -2,7 +2,9 @@
 #include "PairedAudioGroup.h"
 #include "PairedAudioControl.h"
 #include "common/Settings.h"
+#include <QElapsedTimer>
 #include <QHostAddress>
+#include <QLoggingCategory>
 #include <QJsonArray>
 #include <QMap>
 #include <QSet>
@@ -14,11 +16,17 @@
 
 namespace {
 const QString kServer = QStringLiteral("server");
-QString ipv4(const QString &address)
+QString mediaAddress(const QString &address)
 {
-  bool valid = false;
-  const auto ip = QHostAddress(address).toIPv4Address(&valid);
-  return valid ? QHostAddress(ip).toString() : QString();
+  const QHostAddress host(address);
+  bool isV4 = false;
+  const auto ip = host.toIPv4Address(&isV4);
+  if (isV4)
+    return QHostAddress(ip).toString();
+  if (host.protocol() != QAbstractSocket::IPv6Protocol || !host.scopeId().isEmpty() || host.isMulticast() ||
+      host == QHostAddress::AnyIPv6 || host.isInSubnet(QHostAddress(QStringLiteral("fe80::")), 10))
+    return {};
+  return host.toString();
 }
 bool token(const QString &value, int length)
 {
@@ -47,13 +55,13 @@ bool readOffer(const QJsonObject &object, const QString &address, preview::Invit
   const int port = object.value("port").toInt();
   const auto now = preview::unixSeconds();
   if (media.size() != 30 || control.size() != 32 || !ssrc || !value.ssrc || !expiry ||
-      value.expiresUnixSeconds <= now || value.expiresUnixSeconds > now + 600 || port < 1 || port > 65535 ||
-      ipv4(address).isEmpty())
+      !preview::validInvitationExpiry(value.expiresUnixSeconds, now) || port < 1 || port > 65535 ||
+      mediaAddress(address).isEmpty())
     return false;
   std::copy(media.begin(), media.end(), value.mediaKey.begin());
   std::copy(control.begin(), control.end(), value.controlKey.begin());
   value.port = static_cast<std::uint16_t>(port);
-  value.addresses = {ipv4(address).toStdString()};
+  value.addresses = {mediaAddress(address).toStdString()};
   return true;
 }
 } // namespace
@@ -86,8 +94,15 @@ struct PairedAudioGroup::Impl
     void join()
     {
       stop = true;
-      if (thread.joinable())
+      if (thread.joinable()) {
+        QElapsedTimer elapsed;
+        elapsed.start();
         thread.join();
+        // Route changes and disconnects can wait here on the owning Qt thread.
+        // Report only unusually slow stops; never log from an audio callback.
+        if (elapsed.elapsed() >= 100)
+          qWarning("Audio worker shutdown took %lld ms", static_cast<long long>(elapsed.elapsed()));
+      }
       options.sharedPlayback.reset();
       options.localOutputState.reset();
       if (options.invitation) {
@@ -126,6 +141,12 @@ struct PairedAudioGroup::Impl
     // "server" is a route role, never a persistent identity.
     return source == kServer && !control->isServer() ? control->peerIds().value(0) : source;
   }
+  void releaseLocalOutput()
+  {
+    if (localOutput && !preview::restoreLocalOutputState(localOutput))
+      Q_EMIT q->localPlaybackRestoreFailed();
+    localOutput.reset();
+  }
   void clearRuntime()
   {
     for (auto &worker : receiving)
@@ -139,7 +160,7 @@ struct PairedAudioGroup::Impl
     receiving.clear();
     sending.reset();
     playback.reset();
-    localOutput.reset();
+    releaseLocalOutput();
     sendRoute = {};
     lastPlan = {};
     Q_EMIT q->senderChanged(false, false);
@@ -293,9 +314,9 @@ struct PairedAudioGroup::Impl
     options.test = test;
     options.testDuration = std::chrono::seconds(30);
     options.controlOwnsLifetime = true;
+    if (!localOutput)
+      localOutput = preview::createLocalOutputState();
     if (!test) {
-      if (!localOutput)
-        localOutput = preview::createLocalOutputState();
       options.localPlayback = localPlayback;
       options.localOutputState = localOutput;
     }
@@ -324,7 +345,7 @@ struct PairedAudioGroup::Impl
           value.value("source").toString(),
           {},
           value.value("name").toString(),
-          ipv4(value.value("address").toString())
+          mediaAddress(value.value("address").toString())
       };
       if (!token(route.id, 32) || (route.source != kServer && !token(route.source, 64)) || route.name.isEmpty() ||
           route.name.size() > 255 || route.address.isEmpty() || desired.contains(route.id) ||
@@ -341,7 +362,7 @@ struct PairedAudioGroup::Impl
           {},
           value.value("sink").toString(),
           value.value("name").toString(),
-          ipv4(value.value("address").toString())
+          mediaAddress(value.value("address").toString())
       };
       if (!token(next.id, 32) || (next.sink != kServer && !token(next.sink, 64)) || next.name.isEmpty() ||
           next.name.size() > 255 || next.address.isEmpty())
@@ -363,7 +384,7 @@ struct PairedAudioGroup::Impl
         sending->join();
       sending.reset();
       if (sendRoute.sink != next.sink || role != "send")
-        localOutput.reset();
+        releaseLocalOutput();
     }
     sendRoute = next;
     if (role != "send")
@@ -391,7 +412,7 @@ struct PairedAudioGroup::Impl
   }
   QString address(const QString &node, const QString &other) const
   {
-    return ipv4(node == kServer ? control->localAddress(other) : control->peerAddress(node));
+    return mediaAddress(node == kServer ? control->localAddress(other) : control->peerAddress(node));
   }
   void rebuild()
   {
@@ -507,7 +528,7 @@ void PairedAudioGroup::setLocalState(bool listen, bool available)
   if (!available && d->sending) {
     d->sending->join();
     d->sending.reset();
-    d->localOutput.reset();
+    d->releaseLocalOutput();
     d->sendRoute = {};
     d->lastPlan = {};
     Q_EMIT senderChanged(false, false);

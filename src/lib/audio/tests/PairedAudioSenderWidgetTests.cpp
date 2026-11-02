@@ -249,8 +249,8 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop
     receiver.start(std::move(options));
   });
   widget.show();
-  control->configure(true, true, {}, {QStringLiteral("original-client")});
-  remote.configure(false, true, QStringLiteral("127.0.0.1"));
+  control->configure(true, true, {}, {{QStringLiteral("original-client"), QString::fromLatin1(QSslCertificate::fromPath(clientPem).first().digest(QCryptographicHash::Sha256).toHex())}});
+  remote.configure(false, true, QStringLiteral("127.0.0.1"), {}, QString::fromLatin1(QSslCertificate::fromPath(serverPem).first().digest(QCryptographicHash::Sha256).toHex()));
   const bool senderReady = waitFor([&] { return receiver.connected && muteIs(true) && local->isVisible(); }, 12000);
   if (!senderReady) {
     auto *label = widget.findChild<QLabel *>(QStringLiteral("audioStatusLabel"));
@@ -323,12 +323,20 @@ void exercise(QApplication &app, const QTemporaryDir &temporary, bool remoteStop
           "Remote retry released the sender mute");
     stop->click();
   }
-  check(waitFor([&] { return muteIs(originallyMuted) && stop->isHidden() && local->isHidden() && watchdogChildren() == 0; }, 2000),
-        "Stop did not restore original mute and hide sender controls");
+  check(waitFor([&] {
+    const bool expectedButton = remoteStop ? stop->isHidden()
+                                           : stop->isVisible() && stop->text() == QStringLiteral("恢复共享本机声音");
+    return muteIs(originallyMuted) && expectedButton && local->isHidden() && watchdogChildren() == 0;
+  }, 2000), "Stop did not restore original mute or show the correct resume control");
   check(waitFor([&] { return stopMessages > 0; }, 1000), "Session stop was not advertised");
   check(disconnected == 0 && control->peerIds().size() == 1 && remote.peerIds().size() == 1,
         "Media stop disconnected paired TLS");
   check(!dialogs.seen && !QApplication::activeModalWidget(), "Unexpected audio authorization dialog");
+  if (!remoteStop) {
+    stop->click();
+    check(stop->isHidden() && stop->text() == QStringLiteral("停止共享本机声音"),
+          "Resume did not restore the sender's available state");
+  }
   check(contents(clientsDb) == clientsBefore && contents(serversDb) == serversBefore &&
         QDir(temporary.path()).entryList(QDir::Files) == filesBefore, "Pairing/files changed");
   std::cout << "actual_sender=1 default_mute=1 checkbox_restore_remute=" << (!remoteStop && !originallyMuted)

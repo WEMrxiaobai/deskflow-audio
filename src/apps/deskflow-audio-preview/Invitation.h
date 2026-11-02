@@ -40,6 +40,9 @@ Invitation loadInvitation(const std::filesystem::path &);
 // Call on all exit paths; Invitation deliberately has no implicit copying destructor.
 void erase(Invitation &) noexcept;
 std::uint64_t unixSeconds();
+// Offers last 600 seconds according to their issuer. Allow up to two minutes
+// of peer clock skew; the receiver still enforces its own expiration.
+bool validInvitationExpiry(std::uint64_t expiry, std::uint64_t now) noexcept;
 
 enum class ControlType : std::uint8_t
 {
@@ -56,7 +59,8 @@ std::array<std::uint8_t, 30> sessionMediaKey(const Invitation &, const Nonce &);
 std::vector<std::uint8_t> controlPacket(const Invitation &, ControlType, const Nonce &);
 // Outputs are unchanged on failure. Stateless verification does NOT prevent replay.
 // Caller must erase its Invitation even when another operation throws.
-// enforceExpiry=false is ONLY for an already-connected endpoint and nonce.
+// Expiry verification tolerates peer clock skew. The issuing receiver must also
+// enforce its own exact deadline. enforceExpiry=false is ONLY for an already-connected endpoint and nonce.
 bool verifyControl(
     const Invitation &, std::span<const std::uint8_t>, ControlType &, Nonce &, bool enforceExpiry = true
 ) noexcept;

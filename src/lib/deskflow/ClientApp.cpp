@@ -8,6 +8,7 @@
 
 #include "deskflow/ClientApp.h"
 
+#include "arch/Arch.h"
 #include "base/Event.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
@@ -170,6 +171,12 @@ void ClientApp::scheduleClientRestart(double retryTime)
 void ClientApp::handleClientConnected()
 {
   LOG_DEBUG("connected to server");
+  const auto actualServer = m_client->getServerAddress();
+  ipcSendToClient(
+      "serverAddress",
+      actualServer.getAddress() ? QString::fromStdString(ARCH->addrToString(actualServer.getAddress())) : QString()
+  );
+  ipcSendToClient("keyboardServerFingerprint", m_client->getServerFingerprint());
   ipcSendConnectionState(deskflow::core::ConnectionState::Connected);
   // Reset server index on successful connection
   m_currentServerIndex = 0;
@@ -178,6 +185,8 @@ void ClientApp::handleClientConnected()
 
 void ClientApp::handleClientFailed(const Event &e)
 {
+  ipcSendToClient("keyboardServerFingerprint", {});
+  ipcSendToClient("serverAddress", {});
   if ((++m_lastServerAddressIndex) < m_client->getLastResolvedAddressesCount()) {
     // Try next resolved address for current hostname
     std::unique_ptr<Client::FailInfo> info(static_cast<Client::FailInfo *>(e.getData()));
@@ -206,6 +215,8 @@ void ClientApp::handleClientFailed(const Event &e)
 
 void ClientApp::handleClientRefused(const Event &e)
 {
+  ipcSendToClient("keyboardServerFingerprint", {});
+  ipcSendToClient("serverAddress", {});
   std::unique_ptr<Client::FailInfo> info(static_cast<Client::FailInfo *>(e.getData()));
 
   if (!info->m_retry) {
@@ -224,6 +235,8 @@ void ClientApp::handleClientDisconnected()
 {
   m_retryCount = 0;
   LOG_DEBUG("disconnected from server");
+  ipcSendToClient("keyboardServerFingerprint", {});
+  ipcSendToClient("serverAddress", {});
   ipcSendConnectionState(deskflow::core::ConnectionState::Disconnected);
   if (!m_suspended) {
     scheduleClientRestart(retryTime());

@@ -13,6 +13,7 @@
 #include <QHBoxLayout>
 #include <QHostAddress>
 #include <QLabel>
+#include <QJsonDocument>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -44,15 +45,18 @@ bool readOffer(const QJsonObject &json, const QString &address, preview::Invitat
   QHostAddress host(address);
   bool ipv4 = false;
   const auto ip = host.toIPv4Address(&ipv4);
+  const bool ipv6 = host.protocol() == QAbstractSocket::IPv6Protocol && host.scopeId().isEmpty() &&
+                    !host.isMulticast() && host != QHostAddress::AnyIPv6 &&
+                    !host.isInSubnet(QHostAddress(QStringLiteral("fe80::")), 10);
   const auto now = preview::unixSeconds();
   if (media.size() != 30 || control.size() != 32 || !ssrcOk || !offer.ssrc || !expiresOk ||
-      offer.expiresUnixSeconds <= now || offer.expiresUnixSeconds > now + 600 || port < 1 || port > 65535 || !ipv4)
+      !preview::validInvitationExpiry(offer.expiresUnixSeconds, now) || port < 1 || port > 65535 || (!ipv4 && !ipv6))
     return false;
   std::copy(media.begin(), media.end(), offer.mediaKey.begin());
   std::copy(control.begin(), control.end(), offer.controlKey.begin());
   offer.port = static_cast<std::uint16_t>(port);
   // Media destination is always the actual pinned TLS peer, never an offered IP.
-  offer.addresses = {QHostAddress(ip).toString().toStdString()};
+  offer.addresses = {(ipv4 ? QHostAddress(ip).toString() : host.toString()).toStdString()};
   return true;
 }
 } // namespace
@@ -96,7 +100,14 @@ AudioSharingWidget::AudioSharingWidget(QWidget *parent)
   m_status->setTextFormat(Qt::PlainText);
   m_status->setMinimumHeight(fontMetrics().lineSpacing() * 2);
   layout->addWidget(m_status);
+  m_restoreWarning = new QLabel(this);
+  m_restoreWarning->setObjectName(QStringLiteral("audioRestoreWarning"));
+  m_restoreWarning->setWordWrap(true);
+  m_restoreWarning->setTextFormat(Qt::PlainText);
+  m_restoreWarning->hide();
+  layout->addWidget(m_restoreWarning);
   m_group = new PairedAudioGroup(m_control, &m_playLocally, this);
+  connect(m_group, &PairedAudioGroup::localPlaybackRestoreFailed, this, &AudioSharingWidget::showRestoreWarning);
   for (std::size_t i = 0; i < m_sourceRows.size(); ++i) {
     auto &source = m_sourceRows[i];
     source.container = new QWidget(this);
@@ -143,7 +154,7 @@ AudioSharingWidget::AudioSharingWidget(QWidget *parent)
   connect(m_group, &PairedAudioGroup::statusChanged, m_status, &QLabel::setText);
   connect(m_group, &PairedAudioGroup::sourcesChanged, this, &AudioSharingWidget::refreshSources);
   connect(m_group, &PairedAudioGroup::senderChanged, this, [this](bool sharing, bool overridden) {
-    m_stop->setVisible(sharing);
+    m_stop->setVisible(sharing || m_senderPaused);
     m_localPlayback->setVisible(sharing);
     m_localPlayback->setEnabled(!overridden);
     m_localPlayback->setToolTip(
@@ -155,17 +166,25 @@ AudioSharingWidget::AudioSharingWidget(QWidget *parent)
     Settings::setValue(Settings::Gui::AudioListen, enabled);
     Settings::save();
     m_senderPaused = false;
+    m_stop->setText(QStringLiteral("停止共享本机声音"));
+    if (!m_running)
+      m_stop->setVisible(false);
     if (!m_group->enabled())
       stopSession();
     advertise();
     reconcile();
   });
   connect(m_stop, &QPushButton::clicked, this, [this] {
-    m_senderPaused = true;
+    m_senderPaused = !m_senderPaused;
     if (!m_group->enabled())
       stopSession();
     advertise();
-    m_status->setText(QStringLiteral("已停止共享本机声音 · 键鼠保持连接"));
+    m_stop->setText(m_senderPaused ? QStringLiteral("恢复共享本机声音") : QStringLiteral("停止共享本机声音"));
+    m_stop->setVisible(m_senderPaused);
+    m_status->setText(m_senderPaused ? QStringLiteral("已停止共享本机声音 · 键鼠保持连接")
+                                     : QStringLiteral("已恢复共享 · 等待对方收听"));
+    if (!m_senderPaused)
+      reconcile();
   });
   connect(m_control, &PairedAudioControl::statusChanged, this, [this](const QString &text) {
     if (!m_running && !m_group->enabled())
@@ -197,6 +216,17 @@ AudioSharingWidget::~AudioSharingWidget()
   m_stopRequested = true;
   if (m_worker.joinable())
     m_worker.join();
+  releaseLocalOutput();
+}
+void AudioSharingWidget::showRestoreWarning()
+{
+  m_restoreWarning->setText(QStringLiteral("无法确认已恢复本机声音，请检查系统输出设备的静音设置。"));
+  m_restoreWarning->show();
+}
+void AudioSharingWidget::releaseLocalOutput()
+{
+  if (m_localOutputState && !preview::restoreLocalOutputState(m_localOutputState))
+    showRestoreWarning();
   m_localOutputState.reset();
 }
 void AudioSharingWidget::attach(deskflow::gui::CoreProcess *core)
@@ -204,12 +234,37 @@ void AudioSharingWidget::attach(deskflow::gui::CoreProcess *core)
   m_core = core;
   connect(core, &deskflow::gui::CoreProcess::connectionStateChanged, this, [this] { updateConnection(); });
   connect(core, &deskflow::gui::CoreProcess::processStateChanged, this, [this](deskflow::core::ProcessState state) {
-    if (state != deskflow::core::ProcessState::Started)
+    if (state != deskflow::core::ProcessState::Started) {
       m_connectedNames.clear();
+      m_connectedIdentities.clear();
+      m_connectedServerAddress.clear();
+      m_keyboardServerFingerprint.clear();
+    }
     updateConnection();
   });
   connect(core, &deskflow::gui::CoreProcess::connectedClientsChanged, this, [this](const QStringList &names) {
     m_connectedNames = names;
+    updateConnection();
+  });
+  connect(core, &deskflow::gui::CoreProcess::keyboardClientIdentitiesChanged, this, [this](const QString &encoded) {
+    const auto json = QByteArray::fromBase64(encoded.toLatin1(), QByteArray::Base64UrlEncoding);
+    const auto document = QJsonDocument::fromJson(json);
+    m_connectedIdentities.clear();
+    if (document.isObject()) {
+      const auto object = document.object();
+      for (auto it = object.constBegin(); it != object.constEnd(); ++it)
+        if (it.value().isString())
+          m_connectedIdentities.insert(it.key(), it.value().toString());
+    }
+    updateConnection();
+  });
+  connect(core, &deskflow::gui::CoreProcess::connectedServerAddressChanged, this, [this](const QString &address) {
+    QHostAddress parsed;
+    m_connectedServerAddress = parsed.setAddress(address) ? parsed.toString() : QString();
+    updateConnection();
+  });
+  connect(core, &deskflow::gui::CoreProcess::keyboardServerFingerprintChanged, this, [this](const QString &fingerprint) {
+    m_keyboardServerFingerprint = fingerprint;
     updateConnection();
   });
   auto *timer = new QTimer(this);
@@ -228,10 +283,12 @@ void AudioSharingWidget::updateConnection()
   const bool server = m_core->mode() == Settings::CoreMode::Server;
   const bool ready =
       m_core->isStarted() &&
-      (server ? !m_connectedNames.isEmpty() : m_core->connectionState() == deskflow::core::ConnectionState::Connected);
+      (server ? !m_connectedNames.isEmpty() :
+                (m_core->connectionState() == deskflow::core::ConnectionState::Connected &&
+                 !m_connectedServerAddress.isEmpty() && !m_keyboardServerFingerprint.isEmpty()));
   if (!ready && (m_running || m_localOutputState))
     stopSession(false);
-  m_control->configure(server, ready, Settings::value(Settings::Client::RemoteHost).toString(), m_connectedNames);
+  m_control->configure(server, ready, m_connectedServerAddress, m_connectedIdentities, m_keyboardServerFingerprint);
   if (!ready && !m_running)
     m_status->setText(QStringLiteral("等待键鼠连接 · 配对成功后音频自动可用"));
 }
@@ -342,7 +399,7 @@ void AudioSharingWidget::stopSession(bool inform, bool retry)
     m_status->setText(QStringLiteral("音频连接中断，正在自动重试 · 重连期间保持本机播放设置"));
   } else {
     m_retryClock.invalidate();
-    m_localOutputState.reset();
+    releaseLocalOutput();
     m_activePeer.clear();
     m_session.clear();
   }
@@ -451,7 +508,7 @@ void AudioSharingWidget::startSession(
             if (m_localPlayback)
               m_localPlayback->setVisible(false);
             if (!retry) {
-              m_localOutputState.reset();
+              releaseLocalOutput();
               m_activePeer.clear();
               m_session.clear();
             }

@@ -16,6 +16,7 @@
 #include <QObject>
 #include <QProcess>
 #include <QTimer>
+#include <cstdint>
 
 namespace deskflow::gui {
 
@@ -38,7 +39,10 @@ public:
     StartFailed
   };
 
-  explicit CoreProcess(const ServerConfig &serverConfig);
+  explicit CoreProcess(
+      const ServerConfig &serverConfig, const QString &coreIpcName = {}, const QString &coreExecutable = {},
+      const QString &daemonIpcName = {}, const QString &singletonName = {}
+  );
 
   void start(std::optional<ProcessMode> processMode = std::nullopt);
   void stop(std::optional<ProcessMode> processMode = std::nullopt);
@@ -88,6 +92,9 @@ Q_SIGNALS:
   void secureSocket(bool enabled);
   void daemonIpcClientConnectionFailed();
   void connectedClientsChanged(const QStringList &clients);
+  void keyboardClientIdentitiesChanged(const QString &encodedIdentities);
+  void keyboardServerFingerprintChanged(const QString &fingerprint);
+  void connectedServerAddressChanged(const QString &address);
   void securityLevelChanged(QString securityLevel);
   void unrecognisedClient(const QString &clientName);
   void connectionRefused(deskflow::core::ConnectionRefusal reason);
@@ -109,12 +116,14 @@ private:
   void stopProcessFromDaemon();
   QPair<bool, QString> persistServerConfig() const;
   void setConnectionState(ConnectionState state);
+  void clearCoreStatus();
   void setProcessState(ProcessState state);
   bool checkSecureSocket(const QString &line);
   void handleLogLines(const QString &text);
   QString correctedAddress(const QString &address) const;
   void setupDaemonLogTail(const QString &logPath);
   void checkExistingProcess();
+  void stopExistingCoreSafely(ipc::CoreIpcClient *client);
   static QString makeQuotedArgs(const QString &app, const QStringList &args);
   static QString processModeToString(const Settings::ProcessMode mode);
   static QString processStateToString(const CoreProcess::ProcessState state);
@@ -134,6 +143,11 @@ private:
   FileTail *m_daemonFileTail = nullptr;
   QProcess *m_process = nullptr;
   QString m_appPath;
+  QString m_coreIpcName;
+  QString m_daemonIpcName;
+  QString m_singletonName;
+  bool m_adoptedExistingCore = false;
+  std::uint64_t m_operationGeneration = 0;
 };
 
 } // namespace deskflow::gui

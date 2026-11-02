@@ -5,6 +5,7 @@
  */
 
 #include "IpcServer.h"
+#include "WindowsIpcAccess.h"
 
 #include "base/Log.h"
 #include "common/VersionInfo.h"
@@ -13,6 +14,13 @@
 #include <QLocalSocket>
 
 namespace deskflow::core::ipc {
+namespace {
+// Events are delivered once to the first GUI that attaches. Bound both count
+// and storage: some events contain peer-controlled names or fingerprints.
+constexpr qsizetype kMaxPendingEvents = 64;
+constexpr qsizetype kMaxPendingCharacters = 32768;
+constexpr qint64 kMaxMessageBytes = 65536; // Includes newline.
+}
 
 IpcServer::IpcServer(QObject *parent, const QString &serverName, const QString &typeName)
     : QObject(parent),
@@ -51,7 +59,17 @@ void IpcServer::handleNewConnection()
   }
 
   LOG_DEBUG("%s ipc server got new connection", m_typeName.constData());
+#ifdef Q_OS_WIN
+  if ((m_typeName == "core" || m_typeName == "daemon") &&
+      !detail::authorizePipe(clientSocket, m_typeName == "core" ? detail::AccessServer::Core : detail::AccessServer::Daemon)) {
+    LOG_WARN("%s ipc server rejected client session", m_typeName.constData());
+    clientSocket->abort();
+    clientSocket->deleteLater();
+    return;
+  }
+#endif
   m_clients.insert(clientSocket);
+  clientSocket->setReadBufferSize(kMaxMessageBytes);
 
   connect(clientSocket, &QLocalSocket::readyRead, this, &IpcServer::handleReadyRead);
   connect(clientSocket, &QLocalSocket::disconnected, this, &IpcServer::handleDisconnected);
@@ -63,25 +81,28 @@ void IpcServer::handleReadyRead()
   const auto clientSocket = qobject_cast<QLocalSocket *>(sender());
   LOG_VERBOSE("%s ipc server ready to read data", m_typeName.constData());
 
-  QByteArray data = clientSocket->readAll();
-  if (data.isEmpty()) {
-    LOG_WARN("%s ipc server got empty message", m_typeName.constData());
-    return;
+  // QLocalSocket owns a separate bounded buffer for each client. Keep partial
+  // lines there until their delimiter arrives, including after complete lines.
+  while (clientSocket->canReadLine()) {
+    const auto data = clientSocket->readLine(kMaxMessageBytes + 1);
+    if (data.size() > kMaxMessageBytes || !data.endsWith('\n')) {
+      clientSocket->abort();
+      return;
+    }
+#ifdef Q_OS_WIN
+    if ((m_typeName == "core" || m_typeName == "daemon") &&
+        !detail::authorizePipe(clientSocket, m_typeName == "core" ? detail::AccessServer::Core : detail::AccessServer::Daemon)) {
+      clientSocket->abort();
+      return;
+    }
+#endif
+    processMessage(clientSocket, QString::fromUtf8(data.constData(), data.size() - 1));
+    if (clientSocket->state() != QLocalSocket::ConnectedState)
+      return;
   }
-
-  // we don't handle incomplete messages yet; each socket read must have delimiters.
-  if (!data.contains('\n')) {
-    LOG_WARN("%s ipc server got incomplete message: %s", m_typeName.constData(), data.constData());
-    return;
-  }
-
-  // each message is delimited by a newline to keep the protocol super simple.
-  while (data.contains('\n')) {
-    const auto index = data.indexOf('\n');
-    QByteArray messageData = data.left(index);
-    data.remove(0, index + 1);
-    QString message = QString::fromUtf8(messageData);
-    processMessage(clientSocket, message);
+  if (clientSocket->bytesAvailable() >= kMaxMessageBytes) {
+    LOG_WARN("%s ipc client message exceeds limit", m_typeName.constData());
+    clientSocket->abort();
   }
 }
 
@@ -149,6 +170,11 @@ void IpcServer::processMessage(QLocalSocket *clientSocket, const QString &messag
       writeToClientSocket(clientSocket, pending);
     }
     m_pendingMessages.clear();
+    m_pendingCharacters = 0;
+    // A newly attached GUI needs the current state even if another GUI already
+    // consumed the one-time pending messages while the core kept running.
+    for (const auto &status : std::as_const(m_coreStatus))
+      writeToClientSocket(clientSocket, status);
   } else if (command == QStringLiteral("noop")) {
     LOG_DEBUG("%s ipc server got noop message", m_typeName.constData());
     writeToClientSocket(clientSocket, QStringLiteral("ok"));
@@ -163,11 +189,32 @@ void IpcServer::broadcastCommand(const QString &command, const QString &args)
 {
   const auto message = args.isEmpty() ? command : QStringLiteral("%1=%2").arg(command, args);
 
+  const bool isCoreStatus = m_typeName == "core" &&
+      (command == QStringLiteral("coreIdentity") || command == QStringLiteral("connectionState") ||
+       command == QStringLiteral("connectedClients") || command == QStringLiteral("keyboardClientIdentities") ||
+       command == QStringLiteral("serverAddress") || command == QStringLiteral("keyboardServerFingerprint") ||
+       command == QStringLiteral("secureSocket"));
+  if (isCoreStatus)
+    m_coreStatus.insert(command, message);
+
   if (m_clients.isEmpty()) {
+    // State is replayed from its latest snapshot, never from event history.
+    // A countdown is stale by the time a GUI attaches; later updates still
+    // broadcast live.
+    if (isCoreStatus || (m_typeName == "core" && command == QStringLiteral("retryIn")))
+      return;
+    if (message.size() > kMaxPendingCharacters)
+      return;
+    while (!m_pendingMessages.isEmpty() &&
+           (m_pendingMessages.size() >= kMaxPendingEvents ||
+            m_pendingCharacters + message.size() > kMaxPendingCharacters)) {
+      m_pendingCharacters -= m_pendingMessages.takeFirst().size();
+    }
     LOG_VERBOSE(
         "%s ipc server has no clients, message queued: %s", m_typeName.constData(), message.toUtf8().constData()
     );
     m_pendingMessages.append(message);
+    m_pendingCharacters += message.size();
     return;
   }
 
@@ -175,7 +222,17 @@ void IpcServer::broadcastCommand(const QString &command, const QString &args)
       "%s ipc server broadcasting message to %d clients: %s", m_typeName.constData(), m_clients.size(),
       message.toUtf8().constData()
   );
-  for (auto *client : std::as_const(m_clients)) {
+  // A daemon client can become inactive after connecting; do not continue
+  // delivering state to it after a user/session switch.
+  const auto clients = m_clients;
+  for (auto *client : clients) {
+#ifdef Q_OS_WIN
+    if ((m_typeName == "core" || m_typeName == "daemon") &&
+        !detail::authorizePipe(client, m_typeName == "core" ? detail::AccessServer::Core : detail::AccessServer::Daemon)) {
+      client->abort();
+      continue;
+    }
+#endif
     writeToClientSocket(client, message);
     client->flush();
   }

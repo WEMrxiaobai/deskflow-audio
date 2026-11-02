@@ -12,7 +12,8 @@
 
 namespace deskflow::gui::ipc {
 
-CoreIpcClient::CoreIpcClient(QObject *parent) : IpcClient(parent, kCoreIpcName, QStringLiteral("core"))
+CoreIpcClient::CoreIpcClient(QObject *parent, const QString &socketName)
+    : IpcClient(parent, socketName.isEmpty() ? kCoreIpcName : socketName, QStringLiteral("core"))
 {
   // do nothing
 }

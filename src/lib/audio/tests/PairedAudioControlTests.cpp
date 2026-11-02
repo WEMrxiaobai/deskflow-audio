@@ -10,6 +10,7 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonObject>
 #include <QProcess>
 #include <QSslCertificate>
@@ -75,10 +76,12 @@ int main(int argc, char **argv)
     return 2;
   const auto alicePem = directory.filePath(QStringLiteral("alice.pem"));
   const auto bobPem = directory.filePath(QStringLiteral("bob.pem"));
+  const auto malloryPem = directory.filePath(QStringLiteral("mallory.pem"));
   const auto aliceDb = directory.filePath(QStringLiteral("alice-trusted-clients"));
   const auto bobDb = directory.filePath(QStringLiteral("bob-trusted-servers"));
   if (!generate(QString::fromLocal8Bit(argv[1]), alicePem, QStringLiteral("alice")) ||
       !generate(QString::fromLocal8Bit(argv[1]), bobPem, QStringLiteral("bob")) ||
+      !generate(QString::fromLocal8Bit(argv[1]), malloryPem, QStringLiteral("mallory")) ||
       !trust(aliceDb, bobPem) || !trust(bobDb, alicePem))
     return 3;
   QTcpServer probe;
@@ -105,21 +108,70 @@ int main(int argc, char **argv)
   });
   QObject::connect(&alice, &PairedAudioControl::peerDisconnected, [&](const QString &) { ++aliceDown; });
   const auto host = QStringLiteral("127.0.0.1:%1").arg(24800);
-  // Local name is only a liveness restriction: old trust alone is insufficient.
-  alice.configure(true, true, {}, {QStringLiteral("not-bob")});
-  bob.configure(false, true, host);
+  // Both certificates are trusted, but only Bob owns the live keyboard name.
+  FingerprintDatabase trustedClients;
+  trustedClients.read(aliceDb);
+  trustedClients.addTrusted(fingerprint(malloryPem));
+  if (!trustedClients.write(aliceDb)) return 20;
+  const auto aliceId = QString::fromLatin1(fingerprint(alicePem).data.toHex());
+  const auto bobId = QString::fromLatin1(fingerprint(bobPem).data.toHex());
+  const auto malloryId = QString::fromLatin1(fingerprint(malloryPem).data.toHex());
+  b.certificatePath = malloryPem;
+  bob.setConfiguration(b);
+  alice.configure(true, true, {}, {{QStringLiteral("bob"), bobId}});
+  bob.configure(false, true, host, {}, aliceId);
+  if (waitFor([&] { return !alice.peerIds().isEmpty(); }, 2500)) return 21;
+  bob.configure(false, false, host);
+  b.certificatePath = bobPem;
+  bob.setConfiguration(b);
+  // The authenticated fingerprint and the online name must both match.
+  alice.configure(true, true, {}, {{QStringLiteral("not-bob"), bobId}});
+  bob.configure(false, true, host, {}, aliceId);
   if (waitFor([&] { return !alice.peerIds().isEmpty(); }, 2500))
     return 5;
-  alice.configure(true, true, {}, {QStringLiteral("bob")});
+  alice.configure(true, true, {}, {{QStringLiteral("bob"), bobId}});
   if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; }))
     return 6;
   if (alice.peerIds().first() != QString::fromLatin1(fingerprint(bobPem).data.toHex()) ||
       bob.peerIds().first() != QString::fromLatin1(fingerprint(alicePem).data.toHex()) ||
       alice.peerAddress(alice.peerIds().first()).isEmpty())
     return 7;
+  // Slow TLS handshakes from one address cannot fill every slot, evict an
+  // authenticated peer, or prevent that peer reconnecting after a short wait.
+  {
+    QTcpSocket stalled[12];
+    for (auto &socket : stalled)
+      socket.connectToHost(QHostAddress::LocalHost, port);
+    waitFor([&] { return stalled[0].state() == QAbstractSocket::ConnectedState; }, 2000);
+    if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; }, 2000)) return 30;
+    bob.configure(false, false, host);
+    if (!waitFor([&] { return alice.peerIds().isEmpty(); })) return 31;
+    bob.configure(false, true, host, {}, aliceId);
+    if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; }, 8000)) return 32;
+  }
+  // A keyboard disconnect or reconnect under a different certificate revokes
+  // the old audio socket immediately, even while both certificates are trusted.
+  alice.configure(true, true, {}, {{QStringLiteral("bob"), malloryId}});
+  if (!alice.peerIds().isEmpty() || !waitFor([&] { return bob.peerIds().isEmpty(); })) return 22;
+  if (waitFor([&] { return !alice.peerIds().isEmpty(); }, 2500)) return 23;
+  alice.configure(true, true, {}, {{QStringLiteral("bob"), bobId}});
+  if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; })) return 24;
   bob.send(bob.peerIds().first(), {{QStringLiteral("test"), QStringLiteral("confidential")}});
   if (!waitFor([&] { return received == 1; }))
     return 8;
+  // The same address can host another trusted certificate. It must not be
+  // accepted unless it is the one on the active keyboard connection.
+  FingerprintDatabase trustedServers;
+  trustedServers.read(bobDb);
+  trustedServers.addTrusted(fingerprint(malloryPem));
+  if (!trustedServers.write(bobDb)) return 25;
+  bob.configure(false, true, host, {}, malloryId);
+  if (!bob.peerIds().isEmpty() || !waitFor([&] { return alice.peerIds().isEmpty(); })) return 26;
+  if (waitFor([&] { return !bob.peerIds().isEmpty(); }, 2500)) return 27;
+  bob.configure(false, true, host, {}, {});
+  if (waitFor([&] { return !bob.peerIds().isEmpty(); }, 1500)) return 28;
+  bob.configure(false, true, host, {}, aliceId);
+  if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; })) return 29;
   // Plaintext is not interpreted as a control message or another identity.
   QTcpSocket plaintext;
   plaintext.connectToHost(QHostAddress::LocalHost, port);
@@ -135,6 +187,31 @@ int main(int argc, char **argv)
     return 11;
   if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; }))
     return 12;
+  // A same-size replacement with the original timestamp must invalidate the
+  // cached identity and tear down an established audio connection.
+  {
+    QFile pem(alicePem);
+    if (!pem.open(QIODevice::ReadWrite)) return 33;
+    const auto originalTime = QFileInfo(pem).lastModified();
+    const auto original = pem.readAll();
+    if (original.isEmpty() || !pem.seek(0) || pem.write(QByteArray(original.size(), 'x')) != original.size() ||
+        !pem.flush() || !pem.setFileTime(originalTime, QFileDevice::FileModificationTime)) return 34;
+    pem.close();
+    if (!waitFor([&] { return alice.peerIds().isEmpty() && bob.peerIds().isEmpty(); })) return 35;
+    if (!pem.open(QIODevice::ReadWrite) || !pem.seek(0) || pem.write(original) != original.size() ||
+        !pem.flush() || !pem.setFileTime(originalTime, QFileDevice::FileModificationTime)) return 36;
+    pem.close();
+    if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; })) return 37;
+  }
+  // Separate certificate and private-key files remain supported too.
+  b.certificatePath = bobPem + QStringLiteral(".crt");
+  b.privateKeyPath = bobPem;
+  bob.setConfiguration(b);
+  if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; })) return 38;
+  b.certificatePath = bobPem;
+  b.privateKeyPath.clear();
+  bob.setConfiguration(b);
+  if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; })) return 39;
   // Revocation applies to an established TLS socket, not only the next handshake.
   if (!trust(aliceDb, {}))
     return 13;
@@ -147,13 +224,13 @@ int main(int argc, char **argv)
   if (!waitFor([&] { return alice.peerIds().size() == 1 && bob.peerIds().size() == 1; }))
     return 17;
   // Losing the keyboard readiness lease tears down audio immediately.
-  alice.configure(true, false, {}, {QStringLiteral("bob")});
+  alice.configure(true, false, {}, {{QStringLiteral("bob"), bobId}});
   if (!alice.peerIds().isEmpty() || !waitFor([&] { return bob.peerIds().isEmpty(); }))
     return 18;
   // TLS without original client-certificate checking must never enable listening.
   a.checkPeers = false;
   alice.setConfiguration(a);
-  alice.configure(true, true, {}, {QStringLiteral("bob")});
+  alice.configure(true, true, {}, {{QStringLiteral("bob"), bobId}});
   if (waitFor([&] { return !alice.peerIds().isEmpty(); }, 2500))
     return 19;
   bob.configure(false, false, host);

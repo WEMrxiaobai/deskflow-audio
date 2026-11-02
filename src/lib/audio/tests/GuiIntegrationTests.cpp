@@ -99,9 +99,14 @@ int main(int argc, char **argv)
     auto *status = widget.findChild<QLabel *>(QStringLiteral("audioStatusLabel"));
     auto *control = widget.findChild<PairedAudioControl *>();
     bool toggledOn = false, toggledOff = false;
+    bool pauseResume = false;
     QTimer::singleShot(0, &widget, [&] {
-      if (!listen)
+      if (!listen || !stop)
         return;
+      stop->click();
+      const bool paused = stop->isVisible() && stop->text() == QStringLiteral("恢复共享本机声音");
+      stop->click();
+      pauseResume = paused && stop->isHidden() && stop->text() == QStringLiteral("停止共享本机声音");
       listen->click();
       toggledOn = listen->isChecked() && Settings::value(Settings::Gui::AudioListen).toBool();
       listen->click();
@@ -121,7 +126,7 @@ int main(int argc, char **argv)
                 << " dialogs=" << dialogs.seen << '\n';
       std::cout << "local_playback_default_off=" << localDefaultOff << " local_playback_persisted=" << localPersisted
                 << '\n';
-      result = controls && toggledOn && toggledOff && idle && isolated && localDefaultOff && localPersisted ? 0 : 6;
+      result = controls && toggledOn && toggledOff && idle && isolated && localDefaultOff && localPersisted && pauseResume ? 0 : 6;
       app.quit();
     });
     QTimer::singleShot(6000, &app, [&] {

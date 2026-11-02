@@ -84,23 +84,30 @@ bool validType(ControlType type)
 void validate(const Invitation &invite)
 {
   const auto now = unixSeconds();
-  if (invite.port == 0 || invite.ssrc == 0 || invite.expiresUnixSeconds < now ||
-      invite.expiresUnixSeconds - now > 660 || invite.addresses.empty() || invite.addresses.size() > 8)
+  if (invite.port == 0 || invite.ssrc == 0 || !validInvitationExpiry(invite.expiresUnixSeconds, now) ||
+      invite.addresses.empty() || invite.addresses.size() > 8)
     fail("Invalid or expired audio invitation");
   for (std::size_t i = 0; i < invite.addresses.size(); ++i) {
     const auto &address = invite.addresses[i];
     IN_ADDR ipv4{};
-    if (address.empty() || address.size() > 15 || InetPtonA(AF_INET, address.c_str(), &ipv4) != 1)
-      fail("Invalid invitation IPv4 address");
-    const auto ip = ntohl(ipv4.S_un.S_addr);
-    if (ip == 0 || ip == 0xffffffffU || (ip & 0xf0000000U) == 0xe0000000U)
-      fail("Unusable invitation IPv4 address");
-    char canonical[INET_ADDRSTRLEN]{};
-    if (!InetNtopA(AF_INET, &ipv4, canonical, sizeof(canonical)) || address != canonical)
-      fail("Noncanonical invitation IPv4 address");
+    IN6_ADDR ipv6{};
+    char canonical[INET6_ADDRSTRLEN]{};
+    if (InetPtonA(AF_INET, address.c_str(), &ipv4) == 1) {
+      const auto ip = ntohl(ipv4.S_un.S_addr);
+      if (ip == 0 || ip == 0xffffffffU || (ip & 0xf0000000U) == 0xe0000000U ||
+          !InetNtopA(AF_INET, &ipv4, canonical, sizeof(canonical)))
+        fail("Unusable invitation IPv4 address");
+    } else if (InetPtonA(AF_INET6, address.c_str(), &ipv6) == 1) {
+      if (IN6_IS_ADDR_UNSPECIFIED(&ipv6) || IN6_IS_ADDR_MULTICAST(&ipv6) || IN6_IS_ADDR_LINKLOCAL(&ipv6) ||
+          IN6_IS_ADDR_V4MAPPED(&ipv6) || !InetNtopA(AF_INET6, &ipv6, canonical, sizeof(canonical)))
+        fail("Unusable invitation IPv6 address");
+    } else
+      fail("Invalid invitation IP address");
+    if (address != canonical)
+      fail("Noncanonical invitation IP address");
     for (std::size_t j = 0; j < i; ++j)
       if (invite.addresses[j] == address)
-        fail("Duplicate invitation IPv4 address");
+        fail("Duplicate invitation IP address");
   }
 }
 std::array<std::uint8_t, 32> hmac(std::span<const std::uint8_t> key, std::span<const std::uint8_t> bytes)
@@ -198,6 +205,10 @@ std::uint64_t unixSeconds()
   if (value < 0)
     fail("Invalid system time for audio invitation");
   return static_cast<std::uint64_t>(value);
+}
+bool validInvitationExpiry(std::uint64_t expiry, std::uint64_t now) noexcept
+{
+  return expiry >= now ? expiry - now <= 720 : now - expiry <= 120;
 }
 void erase(Invitation &invite) noexcept
 {

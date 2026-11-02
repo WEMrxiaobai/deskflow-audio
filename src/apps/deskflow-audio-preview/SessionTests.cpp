@@ -18,6 +18,7 @@
 #include <thread>
 
 using namespace std::chrono_literals;
+extern std::atomic<bool> holdPrepare, prepareEntered;
 namespace {
 void check(bool condition, const char *message)
 {
@@ -64,6 +65,11 @@ void validation()
   receiver.handshakeTimeout = 0ms;
   rejects([&] { preview::runSession(receiver, stop); });
   receiver.handshakeTimeout = 60001ms;
+  rejects([&] { preview::runSession(receiver, stop); });
+  receiver.handshakeTimeout = 1s;
+  receiver.firstMediaTimeout = 0ms;
+  rejects([&] { preview::runSession(receiver, stop); });
+  receiver.firstMediaTimeout = 60001ms;
   rejects([&] { preview::runSession(receiver, stop); });
   preview::SessionOptions sender;
   sender.test = true;
@@ -145,6 +151,31 @@ void cooperativeWaitingStop()
       "Waiting receiver did not stop cooperatively"
   );
 }
+void cooperativePlaybackPreparation()
+{
+  preview::SharedPlayback playback(true);
+  std::atomic<bool> ownerStop{false}, otherStop{false};
+  holdPrepare = true;
+  prepareEntered = false;
+  auto owner = std::async(std::launch::async, [&] { return playback.prepare(ownerStop); });
+  const auto until = std::chrono::steady_clock::now() + 2s;
+  while (!prepareEntered && std::chrono::steady_clock::now() < until)
+    std::this_thread::sleep_for(1ms);
+  const bool entered = prepareEntered;
+  auto other = std::async(std::launch::async, [&] { return playback.prepare(otherStop); });
+  std::this_thread::sleep_for(30ms);
+  otherStop = true;
+  const bool otherFinished = other.wait_for(500ms) == std::future_status::ready;
+  ownerStop = true;
+  const bool ownerFinished = owner.wait_for(500ms) == std::future_status::ready;
+  holdPrepare = false;
+  const auto otherResult = other.get();
+  const auto ownerResult = owner.get();
+  check(entered && otherFinished && ownerFinished && !ownerResult && !otherResult,
+        "Playback setup did not cancel during initialization and lock contention");
+  std::atomic<bool> retryStop{false};
+  check(playback.prepare(retryStop).has_value(), "Playback setup could not retry after cancellation");
+}
 void noOverlap()
 {
   auto receiver = memoryReceiver();
@@ -201,20 +232,65 @@ void rejectsUnauthenticatedHello()
   });
   check(!connected, "Receiver accepted a Hello without the authenticated offer secret");
 }
-void memoryPair()
+void missingFirstMedia()
 {
   auto receiver = memoryReceiver();
+  receiver.firstMediaTimeout = 150ms;
+  receiver.controlOwnsLifetime = true;
+  std::atomic<bool> stop{false};
+  SOCKET socketHandle = INVALID_SOCKET;
+  struct SocketGuard
+  {
+    SOCKET &socketHandle;
+    ~SocketGuard() { if (socketHandle != INVALID_SOCKET) closesocket(socketHandle); }
+  } guard{socketHandle};
+  receiver.onReady = [&](const auto &offer) {
+    socketHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    check(socketHandle != INVALID_SOCKET, "Cannot create test sender");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(offer.port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const auto hello = preview::controlPacket(offer, preview::ControlType::Hello, preview::randomNonce());
+    check(sendto(socketHandle, reinterpret_cast<const char *>(hello.data()), static_cast<int>(hello.size()), 0,
+                 reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == static_cast<int>(hello.size()),
+          "Cannot send authenticated Hello");
+    // A packet from the expected endpoint is not enough: media must authenticate.
+    const char invalid[] = "not authenticated media";
+    check(sendto(socketHandle, invalid, sizeof(invalid), 0, reinterpret_cast<const sockaddr *>(&address),
+                 sizeof(address)) == sizeof(invalid), "Cannot send invalid media");
+  };
+  bool connected = false, failed = false;
+  const auto start = std::chrono::steady_clock::now();
+  rejects([&] {
+    preview::runSession(receiver, stop, [&](const auto &event) {
+      connected |= event.state == preview::SessionState::Connected;
+      failed |= event.state == preview::SessionState::Failed;
+    });
+  });
+  check(!connected && failed && !stop, "Missing first media reported connected or failed to trigger retry");
+  check(std::chrono::steady_clock::now() - start < 2s, "Missing first media did not time out promptly");
+}
+void memoryPair(bool ipv6 = false)
+{
+  auto receiver = memoryReceiver();
+  receiver.expectedSenderAddress = ipv6 ? "::1" : "127.0.0.1";
   std::atomic<bool> receiverStop{false}, senderStop{false};
   std::promise<Offer> ready;
   auto published = ready.get_future();
   std::uint64_t received = 0, sent = 0;
+  bool prematureConnected = false;
   int readyCalls = 0;
   receiver.onReady = [&](const auto &value) {
     ++readyCalls;
-    ready.set_value(Offer{value});
+    Offer offer{value};
+    if (ipv6)
+      offer.value.addresses = {"::1"};
+    ready.set_value(offer);
   };
   auto worker = std::async(std::launch::async, [&] {
     preview::runSession(receiver, receiverStop, [&](const auto &event) {
+      prematureConnected |= event.state == preview::SessionState::Connected && event.packets == 0;
       received = std::max(received, event.packets);
     });
   });
@@ -237,11 +313,13 @@ void memoryPair()
     if (worker.valid()) {
       try {
         worker.get();
-      } catch (...) {
+      } catch (const std::exception &error) {
+        std::cerr << "Receiver error: " << error.what() << '\n';
       }
     }
     throw;
   }
+  check(!prematureConnected, "Receiver reported connected before decoding media");
   check(readyCalls == 1 && received >= 600 && sent >= 600, "In-memory authenticated SRTP pair failed");
   std::cout << "memory_pair_sent=" << sent << " decoded=" << received << " onReady=" << readyCalls << '\n';
 }
@@ -252,9 +330,12 @@ int main()
     validation();
     deadlineAndCallbacks();
     cooperativeWaitingStop();
+    cooperativePlaybackPreparation();
     noOverlap();
     rejectsUnauthenticatedHello();
+    missingFirstMedia();
     memoryPair();
+    memoryPair(true);
     std::cout << "Session tests passed: memory-only offers, validation, HMAC rejection, deadlines, callbacks, stop, "
                  "exclusion, SRTP\n";
     return 0;

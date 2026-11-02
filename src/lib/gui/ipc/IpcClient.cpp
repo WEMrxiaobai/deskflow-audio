@@ -13,6 +13,9 @@
 #include <QTimer>
 
 namespace deskflow::gui::ipc {
+namespace {
+constexpr qint64 kMaxMessageBytes = 65536; // Includes newline.
+}
 
 IpcClient::IpcClient(QObject *parent, const QString &socketName, const QString &typeName)
     : QObject(parent),
@@ -20,6 +23,7 @@ IpcClient::IpcClient(QObject *parent, const QString &socketName, const QString &
       m_socketName(socketName), // NOSONAR - Qt memory
       m_typeName(typeName)
 {
+  m_socket->setReadBufferSize(kMaxMessageBytes);
   connect(m_socket, &QLocalSocket::disconnected, this, &IpcClient::handleDisconnected);
   connect(m_socket, &QLocalSocket::errorOccurred, this, &IpcClient::handleErrorOccurred);
   connect(m_socket, &QLocalSocket::readyRead, this, &IpcClient::handleReadyRead);
@@ -119,23 +123,26 @@ void IpcClient::handleErrorOccurred()
 
 void IpcClient::handleReadyRead()
 {
-  QByteArray data = m_readBuffer + m_socket->readAll();
-  m_readBuffer.clear();
+  while (m_socket->canReadLine()) {
+    const auto data = m_socket->readLine(kMaxMessageBytes + 1);
+    if (data.size() > kMaxMessageBytes || !data.endsWith('\n')) {
+      disconnectFromServer();
+      Q_EMIT connectionFailed();
+      return;
+    }
+    const auto message = QString::fromUtf8(data.constData(), data.size() - 1);
 
-  while (data.contains('\n')) {
-    const auto index = data.indexOf('\n');
-    const auto message = QString::fromUtf8(data.left(index));
-    data.remove(0, index + 1);
-
-    qDebug().noquote() << QStringLiteral("%1 ipc client message: %2").arg(m_typeName, message);
     const auto parts = message.split('=');
     if (parts.isEmpty()) {
-      qWarning().noquote() << QStringLiteral("%1 ipc client got invalid message: %2").arg(m_typeName, message);
+      qWarning().noquote() << QStringLiteral("%1 ipc client got invalid message").arg(m_typeName);
       continue;
     }
+    qDebug().noquote() << QStringLiteral("%1 ipc client command: %2").arg(m_typeName, parts.at(0));
 
     if (m_state == State::Connecting) {
       handleHandshakeMessage(parts);
+      if (m_state == State::Unconnected)
+        return;
       continue;
     }
 
@@ -149,8 +156,10 @@ void IpcClient::handleReadyRead()
     processCommand(parts.at(0), parts);
   }
 
-  if (!data.isEmpty()) {
-    m_readBuffer = data;
+  if (m_socket->bytesAvailable() >= kMaxMessageBytes) {
+    qWarning().noquote() << QStringLiteral("%1 ipc server message exceeds limit").arg(m_typeName);
+    disconnectFromServer();
+    Q_EMIT connectionFailed();
   }
 }
 
@@ -179,8 +188,8 @@ void IpcClient::handleHandshakeMessage(const QStringList &parts)
     return;
   }
 
-  if (parts.size() < 2) {
-    qCritical().noquote() << QStringLiteral("%1 ipc server hello missing version").arg(m_typeName);
+  if (parts.size() < 2 || parts.at(1) != versionId) {
+    qCritical().noquote() << QStringLiteral("%1 ipc server sent an invalid hello version").arg(m_typeName);
     disconnectFromServer();
     Q_EMIT connectionFailed();
     return;
@@ -215,7 +224,7 @@ void IpcClient::sendMessage(const QString &message)
   }
 
   m_socket->write(message.toUtf8() + "\n");
-  qDebug().noquote() << QStringLiteral("%1 ipc client sent message: %2").arg(m_typeName, message);
+  qDebug().noquote() << QStringLiteral("%1 ipc client sent command: %2").arg(m_typeName, message.section('=', 0, 0));
 }
 
 } // namespace deskflow::gui::ipc

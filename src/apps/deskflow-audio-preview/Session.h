@@ -24,6 +24,9 @@ namespace preview {
 // last owner restores local output. Never share between concurrently running sessions.
 struct LocalOutputState;
 std::shared_ptr<LocalOutputState> createLocalOutputState();
+// Called only after the sender worker has joined. False means restoration
+// failed or could not be confirmed; the watchdog retains its EOF fallback.
+bool restoreLocalOutputState(const std::shared_ptr<LocalOutputState> &) noexcept;
 // One playback device, one realtime mixer, and up to two independent receivers.
 // prepare/attach/detach run on serialized source workers, never the GUI/audio callback.
 class SharedPlayback final
@@ -33,7 +36,7 @@ public:
   ~SharedPlayback();
   SharedPlayback(const SharedPlayback &) = delete;
   SharedPlayback &operator=(const SharedPlayback &) = delete;
-  deskflow::audio::dsp::PcmFormat prepare();
+  std::optional<deskflow::audio::dsp::PcmFormat> prepare(const std::atomic<bool> &stop);
   void attach(std::size_t slot, deskflow::audio::engine::AudioReceiver *receiver);
   void detach(std::size_t slot) noexcept;
   bool healthy() const noexcept;
@@ -77,7 +80,7 @@ struct SessionOptions
   std::shared_ptr<SharedPlayback> sharedPlayback;
   std::size_t playbackSlot = 0;
   std::shared_ptr<SourcePlaybackControl> playbackControl;
-  std::string expectedSenderAddress; // Group receiver: IPv4 observed by the authenticated broker.
+  std::string expectedSenderAddress; // Group receiver: IP observed by the authenticated broker.
   // Optional sender-only local output policy. Owner keeps this atomic alive until
   // worker joins. Null preserves legacy CLI/test behavior (no endpoint mutation).
   const std::atomic<bool> *localPlayback = nullptr;
@@ -97,6 +100,8 @@ struct SessionOptions
   std::function<void(const Invitation &)> onReady;
   // Applies to both roles, independently of the offer's credential expiry.
   std::chrono::milliseconds handshakeTimeout{10000};
+  // Receiver waits this long after acknowledging the handshake for authenticated media.
+  std::chrono::milliseconds firstMediaTimeout{10000};
 };
 using SessionObserver = std::function<void(const SessionEvent &)>;
 // Blocking control/worker-thread API: never call on the GUI thread. Callbacks run

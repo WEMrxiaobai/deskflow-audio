@@ -10,7 +10,8 @@
 
 namespace deskflow::gui::ipc {
 
-DaemonIpcClient::DaemonIpcClient(QObject *parent) : IpcClient(parent, kDaemonIpcName, QStringLiteral("daemon"))
+DaemonIpcClient::DaemonIpcClient(QObject *parent, const QString &socketName)
+    : IpcClient(parent, socketName.isEmpty() ? kDaemonIpcName : socketName, QStringLiteral("daemon"))
 {
 }
 
