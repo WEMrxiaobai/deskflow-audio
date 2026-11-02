@@ -37,7 +37,7 @@ void raiseCriticalDialog()
 
 void showErrorDialog(const QString &message, const QString &fileLine, QtMsgType type)
 {
-  auto errorType = QtFatalMsg ? QObject::tr("fatal error") : QObject::tr("error");
+  auto errorType = type == QtFatalMsg ? QObject::tr("fatal error") : QObject::tr("error");
   auto title = QStringLiteral("%1 %2").arg(kAppName, errorType);
   auto text = QObject::tr(
                   R"(<p>Please <a href="%1">report a bug</a>)"

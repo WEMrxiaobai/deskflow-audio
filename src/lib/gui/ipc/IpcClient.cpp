@@ -171,7 +171,7 @@ void IpcClient::handleHandshakeMessage(const QStringList &parts)
 {
   if (parts.at(0) == QStringLiteral("error")) {
     const auto detail = parts.size() >= 2 ? parts.at(1) : QStringLiteral("unknown");
-    qCritical().noquote() << QStringLiteral("%1 ipc server rejected connection: %2").arg(m_typeName, detail);
+    qWarning().noquote() << QStringLiteral("%1 ipc server rejected connection: %2").arg(m_typeName, detail);
     disconnectFromServer();
     Q_EMIT connectionFailed();
     return;
@@ -193,7 +193,7 @@ void IpcClient::handleHandshakeMessage(const QStringList &parts)
   }
 
   if (parts.size() < 2 || parts.at(1) != versionId) {
-    qCritical().noquote() << QStringLiteral("%1 ipc server sent an invalid hello version").arg(m_typeName);
+    qWarning().noquote() << QStringLiteral("%1 ipc server sent an invalid hello version").arg(m_typeName);
     disconnectFromServer();
     Q_EMIT connectionFailed();
     return;
@@ -219,13 +219,26 @@ void IpcClient::handleConnectionSuccess()
   // Production names are fixed; injected names are reserved for isolated tests.
   const bool daemon = m_socketName == QLatin1String(kDaemonIpcName);
   const bool core = m_socketName == QLatin1String(kCoreIpcName);
-  if ((daemon || core) && !detail::verifyPipeServer(
-          m_socket, daemon, QDir(QCoreApplication::applicationDirPath()).filePath(QLatin1String(kCoreBinName)))) {
-    qWarning().noquote() << QStringLiteral("%1 ipc server identity could not be verified").arg(m_typeName);
-    m_socket->abort();
-    m_state = State::Unconnected;
-    Q_EMIT connectionFailed();
-    return;
+  if (daemon || core) {
+    const auto result = detail::verifyPipeServer(
+      m_socket, daemon, QDir(QCoreApplication::applicationDirPath()).filePath(QLatin1String(kCoreBinName)));
+    if (!result.verified()) {
+      auto reason = QString::fromLatin1(detail::peerFailureName(result.failure));
+      if (result.error)
+        reason += QStringLiteral(" (Windows error %1)").arg(result.error);
+      for (const auto &lookup : {result.daemonLookup, result.parentLookup}) {
+        if (lookup.stage) {
+          reason += QStringLiteral("; %1").arg(QLatin1String(lookup.stage));
+          if (lookup.error)
+            reason += QStringLiteral(" (Windows error %1)").arg(lookup.error);
+        }
+      }
+      qWarning().noquote() << QStringLiteral("%1 ipc server identity could not be verified: %2").arg(m_typeName, reason);
+      m_socket->abort();
+      m_state = State::Unconnected;
+      Q_EMIT connectionFailed();
+      return;
+    }
   }
 #endif
   const auto versionId = QStringLiteral("%1+%2").arg(kVersion, kVersionGitSha);

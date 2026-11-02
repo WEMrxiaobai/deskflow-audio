@@ -9,6 +9,7 @@
 #include "deskflow/ipc/IpcServer.h"
 #include "gui/config/ServerConfig.h"
 #include "gui/core/CoreProcess.h"
+#include "gui/Messages.h"
 #include "gui/ipc/CoreIpcClient.h"
 #include <QApplication>
 #include <QDir>
@@ -17,12 +18,15 @@
 #include <QJsonDocument>
 #include <QLocalSocket>
 #include <QLockFile>
+#include <QMessageBox>
+#include <QProcess>
 #include <QSharedMemory>
 #include <QTemporaryFile>
 #include <QThread>
 #include <QUuid>
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -32,8 +36,11 @@ using deskflow::core::ConnectionState;
 using deskflow::core::ProcessState;
 using deskflow::gui::CoreProcess;
 std::atomic<bool> identityRejected{false};
+std::atomic<bool> criticalDuringRecovery{false};
 void messages(QtMsgType type, const QMessageLogContext &, const QString &message)
 {
+  if (type == QtCriticalMsg || type == QtFatalMsg)
+    criticalDuringRecovery = true;
   if (type == QtWarningMsg && message.contains(QStringLiteral("existing core has different settings")))
     identityRejected = true;
 }
@@ -181,6 +188,17 @@ int main(int argc, char **argv)
   QApplication::setApplicationName(kAppName);
   QApplication::setOrganizationName(QStringLiteral("DeskflowIntegrationTest"));
   QApplication app(argc, argv);
+  // The dialog is owned by a process-wide static, so test it in a child that
+  // exits without destroying QApplication before that static.
+  if (argc > 1 && std::strcmp(argv[1], "critical-dialog") == 0) {
+    deskflow::gui::messages::messageHandler(QtCriticalMsg, QMessageLogContext{}, QStringLiteral("isolated critical test"));
+    for (auto *widget : QApplication::topLevelWidgets()) {
+      if (auto *dialog = qobject_cast<QMessageBox *>(widget); dialog && dialog->isVisible())
+        std::_Exit(dialog->windowTitle() == kAppName + QStringLiteral(" error") &&
+                           dialog->text().contains(QStringLiteral("critical error")) ? 0 : 1);
+    }
+    std::_Exit(2);
+  }
   Log coreLog;
   const auto folder = QApplication::applicationDirPath() + QStringLiteral("/settings");
   if (!QDir().mkpath(folder))
@@ -197,8 +215,29 @@ int main(int argc, char **argv)
   int result = 0;
   try {
     check(Settings::settingsFile() == path, "Settings escaped isolated fixture");
+    QProcess dialogTest;
+    dialogTest.start(QApplication::applicationFilePath(), {QStringLiteral("critical-dialog")});
+    check(dialogTest.waitForFinished(10000) && dialogTest.exitStatus() == QProcess::NormalExit &&
+              dialogTest.exitCode() == 0,
+          "Critical message dialog was incorrectly labeled fatal");
     const auto name = QStringLiteral("deskflow-core-adoption-") + QUuid::createUuid().toString(QUuid::Id128);
     offlineQueueTest(name + QStringLiteral("-offline"));
+    {
+      const auto unavailableName = name + QStringLiteral("-unavailable");
+      QSharedMemory singleton(unavailableName + QStringLiteral("-singleton"));
+      check(singleton.create(1), "Cannot reserve unavailable core fixture");
+      ServerConfig config;
+      CoreProcess unavailable(config, unavailableName, QApplication::applicationFilePath(),
+                              unavailableName + QStringLiteral("-daemon"), unavailableName + QStringLiteral("-singleton"));
+      unavailable.setMode(Settings::CoreMode::Server);
+      criticalDuringRecovery = false;
+      const auto oldHandler = qInstallMessageHandler(messages);
+      unavailable.start(Settings::ProcessMode::Desktop);
+      const bool stopped = waitFor([&] { return unavailable.processState() == ProcessState::Stopped; }, 7000);
+      qInstallMessageHandler(oldHandler);
+      check(stopped && unavailable.connectionState() == ConnectionState::Disconnected && !criticalDuringRecovery.load(),
+            "Unreachable existing core did not stop cleanly without a critical error");
+    }
     {
       const auto layoutPath = Settings::serverConfigFile();
       check(layoutPath.startsWith(folder + QLatin1Char('/')), "Server fixture layout escaped isolated settings");
@@ -428,11 +467,15 @@ int main(int argc, char **argv)
         waitFor([&] { return recovered.connectionState() == ConnectionState::Listening && clients.isEmpty(); }),
         "Adopted core did not deliver later status changes"
     );
+    criticalDuringRecovery = false;
+    const auto recoveryHandler = qInstallMessageHandler(messages);
     server.dropConnections();
     check(waitFor([&] { return recovered.connectionState() == ConnectionState::Disconnected; }),
           "IPC disconnect did not clear the adopted core status");
     check(waitFor([&] { return recovered.isStarted() && recovered.connectionState() == ConnectionState::Listening; }, 6000),
           "Adopted core did not reconnect and restore its current status");
+    qInstallMessageHandler(recoveryHandler);
+    check(!criticalDuringRecovery.load(), "Recoverable adoption disconnect logged a critical error");
     int startingTransitions = 0;
     QObject::connect(&recovered, &CoreProcess::processStateChanged, [&](ProcessState state) {
       if (state == ProcessState::Starting)

@@ -320,7 +320,7 @@ void CoreProcess::checkExistingProcess()
     m_retryTimer.start(kRetryDelay);
   });
   connect(client, &ipc::CoreIpcClient::connectionFailed, this, [this, client, adoption, generation] {
-    qCritical("could not contact existing core");
+    qWarning("could not contact existing core");
     if (m_coreIpcClient == client) {
       // The core may still be running after a pipe interruption. Clear all
       // leases immediately, then reconnect the same adopted client and replay
