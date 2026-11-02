@@ -8,6 +8,7 @@
 
 #pragma once
 #include <QDialog>
+#include <functional>
 
 #include "gui/config/ServerConfig.h"
 
@@ -23,8 +24,9 @@ class SettingsDialog : public QDialog
 
 public:
   void extracted();
-  SettingsDialog(QWidget *parent, const ServerConfig &serverConfig);
+  SettingsDialog(QWidget *parent, const ServerConfig &serverConfig, std::function<bool(bool)> startupWriter = {});
   ~SettingsDialog() override;
+  bool startupOnlyChange() const { return m_startupOnlyChange; }
 
 Q_SIGNALS:
   void requestRemoveAllSettings();
@@ -65,6 +67,8 @@ private:
    * @return true when any client settings in the gui do not match the stored settings values.
    */
   bool isModified() const;
+  bool otherSettingsModified() const;
+  QVariantList otherSettingsValues() const;
 
   /**
    * @brief isDefault
@@ -84,6 +88,11 @@ private:
   void setButtonBoxEnabledButtons() const;
 
   bool m_interfaceSetOnLoad = false;
+  bool m_startAtLoginOnLoad = false;
+  bool m_startupPathNeedsRepairOnLoad = false;
+  bool m_startupOnlyChange = false;
+  QVariantList m_otherSettingsOnLoad;
+  std::function<bool(bool)> m_startupWriter;
   std::unique_ptr<Ui::SettingsDialog> ui;
   const ServerConfig &m_serverConfig;
   SettingsDialogButtonBox *m_buttonBox = nullptr;

@@ -445,6 +445,12 @@ void MainWindow::clearSettings()
 {
   qDebug() << "clearing settings";
 
+  if (!diagnostic::setStartsAtLogin(false)) {
+    QMessageBox::warning(this, tr("Startup setting could not be saved"),
+                         tr("Could not update the Windows sign-in startup setting. Please check your permissions and try again."));
+    return;
+  }
+
   m_networkMonitor->stopMonitoring();
 
   disconnect(&m_coreProcess, nullptr, this, nullptr);
@@ -457,7 +463,7 @@ void MainWindow::clearSettings()
   m_coreProcess.clearSettings();
 
   m_saveOnExit = false;
-  diagnostic::clearSettings(true);
+  diagnostic::clearSettings(true, false);
 }
 
 bool MainWindow::saveServerConfig()
@@ -489,6 +495,8 @@ void MainWindow::openSettings()
 
   connect(&dialog, &SettingsDialog::requestRemoveAllSettings, this, &MainWindow::clearSettings, Qt::UniqueConnection);
   if (dialog.exec() == QDialog::Accepted) {
+    if (dialog.startupOnlyChange())
+      return;
     Settings::save();
     disconnect(&dialog, &SettingsDialog::requestRemoveAllSettings, nullptr, nullptr);
 

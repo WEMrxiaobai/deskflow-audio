@@ -13,6 +13,7 @@
 
 #include "common/I18N.h"
 #include "common/Settings.h"
+#include "gui/Diagnostic.h"
 #include "gui/TlsUtility.h"
 #include "gui/core/NetworkMonitor.h"
 #include "gui/widgets/SettingsDialogButtonBox.h"
@@ -21,11 +22,13 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QMessageBox>
+#include <utility>
 
 using namespace deskflow::gui;
 
-SettingsDialog::SettingsDialog(QWidget *parent, const ServerConfig &serverConfig)
+SettingsDialog::SettingsDialog(QWidget *parent, const ServerConfig &serverConfig, std::function<bool(bool)> startupWriter)
     : QDialog(parent),
+      m_startupWriter{std::move(startupWriter)},
       ui{std::make_unique<Ui::SettingsDialog>()},
       m_serverConfig(serverConfig),
       m_buttonBox{new SettingsDialogButtonBox(this)}
@@ -81,6 +84,7 @@ SettingsDialog::SettingsDialog(QWidget *parent, const ServerConfig &serverConfig
   setFixedHeight(height());
   setWindowFlags((windowFlags() | Qt::CustomizeWindowHint) & ~Qt::WindowMinMaxButtonsHint);
 
+  m_otherSettingsOnLoad = otherSettingsValues();
   setButtonBoxEnabledButtons();
   initConnections();
 }
@@ -130,6 +134,7 @@ void SettingsDialog::initConnections() const
   connect(ui->rbCloseToTray, &QRadioButton::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(ui->cbElevateDaemon, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(ui->cbAutoUpdate, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
+  connect(ui->cbStartAtLogin, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(ui->cbGuiDebug, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(ui->cbShowVersion, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(ui->cbRequireClientCert, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
@@ -194,8 +199,9 @@ void SettingsDialog::resetAllSettings()
       tr("<p>Are you sure you want to clear all settings and restart %1?</p> <p>This action cannot be undone.</p>")
           .arg(kAppName)
   );
-  if (result == QMessageBox::Yes)
+  if (result == QMessageBox::Yes) {
     Q_EMIT requestRemoveAllSettings();
+  }
 }
 
 void SettingsDialog::updateText()
@@ -220,6 +226,24 @@ void SettingsDialog::updateText()
 
 void SettingsDialog::accept()
 {
+  const bool startAtLogin = ui->cbStartAtLogin->isChecked();
+  const bool userChangedStartup = startAtLogin != m_startAtLoginOnLoad;
+  const bool repairStartupPath = startAtLogin && m_startupPathNeedsRepairOnLoad &&
+                                 diagnostic::startsAtLogin() && !diagnostic::startupPointsToCurrentExecutable();
+  const bool startupChanged = deskflow::platform::isWindows() && (userChangedStartup || repairStartupPath);
+  const bool startupOnlyChange = startupChanged && otherSettingsValues() == m_otherSettingsOnLoad;
+  if (deskflow::platform::isWindows() &&
+      (userChangedStartup || repairStartupPath) &&
+      !(m_startupWriter ? m_startupWriter(startAtLogin) : diagnostic::setStartsAtLogin(startAtLogin))) {
+    QMessageBox::warning(this, tr("Startup setting could not be saved"),
+                         tr("Could not update the Windows sign-in startup setting. Please check your permissions and try again."));
+    return;
+  }
+  if (startupOnlyChange) {
+    m_startupOnlyChange = true;
+    QDialog::accept();
+    return;
+  }
   Settings::setValue(Settings::Core::Port, ui->sbPort->value());
   Settings::setValue(Settings::Core::Interface, ui->comboInterface->currentData());
   Settings::setValue(Settings::Log::Level, ui->comboLogLevel->currentData());
@@ -255,6 +279,10 @@ void SettingsDialog::accept()
 
 void SettingsDialog::loadFromConfig()
 {
+  ui->cbStartAtLogin->setVisible(deskflow::platform::isWindows());
+  m_startAtLoginOnLoad = diagnostic::startsAtLogin();
+  m_startupPathNeedsRepairOnLoad = m_startAtLoginOnLoad && !diagnostic::startupPointsToCurrentExecutable();
+  ui->cbStartAtLogin->setChecked(m_startAtLoginOnLoad);
   ui->sbPort->setValue(Settings::value(Settings::Core::Port).toInt());
   ui->comboLogLevel->setCurrentIndex(
       ui->comboLogLevel->findData(Settings::logLevelText(), Qt::UserRole, Qt::MatchFixedString)
@@ -381,6 +409,7 @@ void SettingsDialog::updateControls()
   ui->rbShowOnStart->setEnabled(writable);
   ui->btnClearAllSettings->setEnabled(writable);
   ui->cbAutoUpdate->setEnabled(writable);
+  ui->cbStartAtLogin->setEnabled(writable);
   ui->cbPreventSleep->setEnabled(writable);
   ui->lineTlsCertPath->setEnabled(writable);
   ui->comboTlsKeyLength->setEnabled(writable);
@@ -418,6 +447,25 @@ void SettingsDialog::logLevelChanged()
 }
 
 bool SettingsDialog::isModified() const
+{
+  return (deskflow::platform::isWindows() &&
+          (ui->cbStartAtLogin->isChecked() != m_startAtLoginOnLoad ||
+           (ui->cbStartAtLogin->isChecked() && m_startupPathNeedsRepairOnLoad))) || otherSettingsModified();
+}
+
+QVariantList SettingsDialog::otherSettingsValues() const
+{
+  return {ui->sbPort->value(), ui->comboInterface->currentData(), ui->comboLogLevel->currentData(),
+          ui->groupLogToFile->isChecked(), ui->lineLogFilename->text(), ui->cbElevateDaemon->isChecked(),
+          ui->rbAutoHide->isChecked(), ui->cbAutoUpdate->isChecked(), ui->cbPreventSleep->isChecked(),
+          ui->lineTlsCertPath->text(), ui->comboTlsKeyLength->currentText(), ui->groupSecurity->isChecked(),
+          ui->rbCloseToTray->isChecked(), ui->rbIconMono->isChecked(), ui->cbRequireClientCert->isChecked(),
+          ui->comboLanguage->currentText(), ui->cbGuiDebug->isChecked(), ui->cbShowVersion->isChecked(),
+          ui->cbRunEnterCommand->isChecked(), ui->cbRunExitCommand->isChecked(), ui->lineCommandEnter->text(),
+          ui->lineCommandExit->text(), ui->groupService->isChecked()};
+}
+
+bool SettingsDialog::otherSettingsModified() const
 {
   const auto processMode = Settings::value(Settings::Core::ProcessMode).value<Settings::ProcessMode>();
   const bool ignoreInterface = !m_interfaceSetOnLoad && (ui->comboInterface->currentIndex() == 0);
@@ -467,6 +515,7 @@ bool SettingsDialog::isDefault() const
       (ui->rbCloseToTray->isChecked() == Settings::defaultValue(Settings::Gui::CloseToTray).toBool()) &&
       (ui->cbElevateDaemon->isChecked() == Settings::defaultValue(Settings::Daemon::Elevate).toBool()) &&
       (ui->cbAutoUpdate->isChecked() == Settings::defaultValue(Settings::Gui::AutoUpdateCheck).toBool()) &&
+      (!deskflow::platform::isWindows() || !ui->cbStartAtLogin->isChecked()) &&
       (ui->cbGuiDebug->isChecked() == Settings::defaultValue(Settings::Log::GuiDebug).toBool()) &&
       (ui->cbShowVersion->isChecked() == Settings::defaultValue(Settings::Gui::ShowVersionInTitle).toBool()) &&
       (ui->rbIconMono->isChecked() == Settings::defaultValue(Settings::Gui::SymbolicTrayIcon).toBool()) &&
@@ -486,6 +535,7 @@ bool SettingsDialog::isDefault() const
 
 void SettingsDialog::resetToDefault()
 {
+  ui->cbStartAtLogin->setChecked(false);
   ui->sbPort->setValue(Settings::defaultValue(Settings::Core::Port).toInt());
   ui->comboLogLevel->setCurrentIndex(
       static_cast<int>(LogLevel::fromOption(Settings::defaultValue(Settings::Log::Level).toString()))

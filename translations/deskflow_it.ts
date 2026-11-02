@@ -743,6 +743,14 @@ Inoltre, verifica di poter %1 il file di configurazione del server: %2</translat
         <source>&lt;p&gt;Keyboard layout support requires matching layouts on all computers. The following layouts from the other computer are not installed on this computer:&lt;/p&gt;&lt;p&gt;&lt;b&gt;%1&lt;/b&gt;&lt;/p&gt;&lt;p&gt;Please install them to enable support for these layouts.&lt;/p&gt;</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Startup setting could not be saved</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not update the Windows sign-in startup setting. Please check your permissions and try again.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>NewComputerWidget</name>
@@ -1290,6 +1298,22 @@ L&apos;abilitazione di questa impostazione disabiliterà l&apos;interfaccia graf
     <message>
         <source>Remove all settings</source>
         <translation type="unfinished">Rimuovi tutte le impostazioni</translation>
+    </message>
+    <message>
+        <source>Start Deskflow when the current user signs in to Windows.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start Deskflow when I sign in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Startup setting could not be saved</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not update the Windows sign-in startup setting. Please check your permissions and try again.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

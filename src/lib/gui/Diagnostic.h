@@ -8,6 +8,9 @@
 
 namespace deskflow::gui::diagnostic {
 
-void clearSettings(bool enableRestart);
+bool startsAtLogin();
+bool startupPointsToCurrentExecutable();
+bool setStartsAtLogin(bool enabled);
+bool clearSettings(bool enableRestart, bool clearStartup = true);
 
 }

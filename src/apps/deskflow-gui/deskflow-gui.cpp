@@ -147,7 +147,8 @@ int main(int argc, char *argv[])
 
   // --no-reset
   if (parser.isSet(resetOption)) {
-    diagnostic::clearSettings(false);
+    if (!diagnostic::clearSettings(false))
+      return s_exitFailed;
   }
 
   MainWindow mainWindow;

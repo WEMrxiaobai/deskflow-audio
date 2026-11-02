@@ -118,6 +118,9 @@ add_library(${target} STATIC
 )
 
 if(WIN32 AND ENABLE_AUDIO_SHARING)
+  add_executable(deskflow-startup-settings-tests EXCLUDE_FROM_ALL tests/StartupSettingsTests.cpp)
+  target_compile_options(deskflow-startup-settings-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-startup-settings-tests PRIVATE gui)
   target_sources(${target} PRIVATE widgets/AudioSharingWidget.cpp widgets/AudioSharingWidget.h audio/PairedAudioControl.cpp audio/PairedAudioControl.h)
   target_sources(${target} PRIVATE audio/PairedAudioGroup.cpp audio/PairedAudioGroup.h)
   add_executable(deskflow-paired-audio-group-tests EXCLUDE_FROM_ALL ../audio/tests/PairedAudioGroupTests.cpp ../audio/tests/GroupSessionFixture.cpp)

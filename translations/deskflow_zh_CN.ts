@@ -743,6 +743,14 @@ Additionally, check you are able to %1 the server config file: %2</source>
         <source>&lt;p&gt;Keyboard layout support requires matching layouts on all computers. The following layouts from the other computer are not installed on this computer:&lt;/p&gt;&lt;p&gt;&lt;b&gt;%1&lt;/b&gt;&lt;/p&gt;&lt;p&gt;Please install them to enable support for these layouts.&lt;/p&gt;</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Startup setting could not be saved</source>
+        <translation type="unfinished">无法保存开机启动设置</translation>
+    </message>
+    <message>
+        <source>Could not update the Windows sign-in startup setting. Please check your permissions and try again.</source>
+        <translation type="unfinished">无法更新 Windows 登录启动设置。请检查权限后重试。</translation>
+    </message>
 </context>
 <context>
     <name>NewComputerWidget</name>
@@ -1101,6 +1109,22 @@ Enabling this setting will disable the server config GUI.</source>
 </context>
 <context>
     <name>SettingsDialog</name>
+    <message>
+        <source>Start Deskflow when I sign in</source>
+        <translation>登录 Windows 时启动 Deskflow</translation>
+    </message>
+    <message>
+        <source>Start Deskflow when the current user signs in to Windows.</source>
+        <translation>当前用户登录 Windows 时自动启动 Deskflow。</translation>
+    </message>
+    <message>
+        <source>Startup setting could not be saved</source>
+        <translation>无法保存开机启动设置</translation>
+    </message>
+    <message>
+        <source>Could not update the Windows sign-in startup setting. Please check your permissions and try again.</source>
+        <translation>无法更新 Windows 登录启动设置。请检查权限后重试。</translation>
+    </message>
     <message>
         <source>Preferences</source>
         <translation>首选项</translation>
