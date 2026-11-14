@@ -10,9 +10,11 @@
 #endif
 #include <aclapi.h>
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <windows.h>
 
 namespace {
@@ -118,6 +120,42 @@ int main()
     expired.expiresUnixSeconds = preview::unixSeconds() - 1;
     rejects([&] { (void)preview::controlPacket(expired, preview::ControlType::Hello, nonce); });
     preview::erase(expired);
+    // 缩短测试邀请寿命，真实跨过有效期：新建连接被拒绝，活动会话仍能验证并发出 STOP。
+    auto shortLived = invite;
+    shortLived.expiresUnixSeconds = preview::unixSeconds() + 1;
+    {
+      preview::EstablishedSessionControl active(shortLived, nonce);
+      const auto stop = active.stopPacket();
+      check(
+          stop == preview::controlPacket(shortLived, preview::ControlType::Stop, nonce),
+          "Established STOP is not wire compatible"
+      );
+      const auto hello = preview::controlPacket(shortLived, preview::ControlType::Hello, nonce);
+      check(!active.verifyStop(hello), "Active session accepted a new HELLO as STOP");
+      std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+      preview::ControlType received = preview::ControlType::Hello;
+      preview::Nonce receivedNonce{};
+      check(
+          !preview::verifyControl(shortLived, hello, received, receivedNonce), "Expired invitation opened a new session"
+      );
+      rejects([&] { preview::EstablishedSessionControl invalid(shortLived, nonce); });
+      check(
+          active.verifyStop(stop) && active.verifyStop(active.stopPacket()),
+          "Credential expiry disabled STOP for an established session"
+      );
+      for (std::size_t index = 0; index < stop.size(); ++index) {
+        auto corrupt = stop;
+        corrupt[index] ^= 1;
+        check(!active.verifyStop(corrupt), "Tampered established STOP passed verification");
+      }
+      auto anotherNonce = nonce;
+      anotherNonce[0] ^= 1;
+      auto fresh = invite;
+      preview::EstablishedSessionControl other(fresh, anotherNonce);
+      check(!other.verifyStop(stop), "Old session STOP affected another nonce");
+      preview::erase(fresh);
+    }
+    preview::erase(shortLived);
     // Deliberate malformed plaintext only after deleting the validated generated test file.
     std::filesystem::remove(path);
     {

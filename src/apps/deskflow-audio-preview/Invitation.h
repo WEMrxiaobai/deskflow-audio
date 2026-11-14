@@ -57,4 +57,23 @@ std::vector<std::uint8_t> controlPacket(const Invitation &, ControlType, const N
 // Outputs are unchanged on failure. Stateless verification does NOT prevent replay.
 // Caller must erase its Invitation even when another operation throws.
 bool verifyControl(const Invitation &, std::span<const std::uint8_t>, ControlType &, Nonce &) noexcept;
+
+// 握手完成后冻结当前会话的停止权限。邀请到期只禁止新建连接，不能使已连接会话
+// 忽略停止指令。该对象只验证原端点、原 nonce 的 STOP，不接受新的 HELLO/ACK。
+class EstablishedSessionControl final
+{
+public:
+  EstablishedSessionControl(const Invitation &, const Nonce &);
+  ~EstablishedSessionControl();
+  EstablishedSessionControl(const EstablishedSessionControl &) = delete;
+  EstablishedSessionControl &operator=(const EstablishedSessionControl &) = delete;
+  [[nodiscard]] std::vector<std::uint8_t> stopPacket() const;
+  [[nodiscard]] bool verifyStop(std::span<const std::uint8_t>) const noexcept;
+
+private:
+  std::array<std::uint8_t, 32> m_key{};
+  Nonce m_nonce{};
+  std::uint32_t m_ssrc = 0;
+  std::uint64_t m_expiry = 0;
+};
 } // namespace preview

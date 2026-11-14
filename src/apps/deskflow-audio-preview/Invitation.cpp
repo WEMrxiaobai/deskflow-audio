@@ -407,4 +407,51 @@ bool verifyControl(
     return false;
   }
 }
+// 只允许仍有效的邀请在握手结束时创建活动会话权限，过期邀请无法绕过建连检查。
+EstablishedSessionControl::EstablishedSessionControl(const Invitation &invite, const Nonce &nonce)
+{
+  validate(invite);
+  m_key = invite.controlKey;
+  m_nonce = nonce;
+  m_ssrc = invite.ssrc;
+  m_expiry = invite.expiresUnixSeconds;
+}
+EstablishedSessionControl::~EstablishedSessionControl()
+{
+  SecureZeroMemory(m_key.data(), m_key.size());
+  SecureZeroMemory(m_nonce.data(), m_nonce.size());
+}
+// 保持原 STOP 线格式兼容；expiry 只是本次握手的绑定字段，不再作为运行会话的时钟。
+std::vector<std::uint8_t> EstablishedSessionControl::stopPacket() const
+{
+  std::vector<std::uint8_t> packet(controlBytes);
+  std::copy(magic.begin(), magic.end(), packet.begin());
+  packet[8] = static_cast<std::uint8_t>(ControlType::Stop);
+  std::copy(m_nonce.begin(), m_nonce.end(), packet.begin() + 9);
+  putBig(std::span(packet).subspan(25, 4), m_ssrc);
+  putBig(std::span(packet).subspan(29, 8), m_expiry);
+  auto tag = hmac(m_key, std::span(packet).first(signedBytes));
+  std::copy(tag.begin(), tag.end(), packet.begin() + signedBytes);
+  SecureZeroMemory(tag.data(), tag.size());
+  return packet;
+}
+// 只在调用方已检查活动 UDP 端点之后使用；HMAC、会话 nonce 和 SSRC 均须匹配。
+bool EstablishedSessionControl::verifyStop(std::span<const std::uint8_t> packet) const noexcept
+{
+  try {
+    if (packet.size() != controlBytes || !std::equal(magic.begin(), magic.end(), packet.begin()) ||
+        packet[8] != static_cast<std::uint8_t>(ControlType::Stop) ||
+        !std::equal(m_nonce.begin(), m_nonce.end(), packet.begin() + 9) || getBig(packet.subspan(25, 4)) != m_ssrc ||
+        getBig(packet.subspan(29, 8)) != m_expiry)
+      return false;
+    auto expected = hmac(m_key, packet.first(signedBytes));
+    volatile unsigned difference = 0;
+    for (std::size_t i = 0; i < expected.size(); ++i)
+      difference = difference | unsigned(expected[i] ^ packet[signedBytes + i]);
+    SecureZeroMemory(expected.data(), expected.size());
+    return difference == 0;
+  } catch (...) {
+    return false;
+  }
+}
 } // namespace preview
