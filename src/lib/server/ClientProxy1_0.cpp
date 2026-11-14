@@ -197,8 +197,10 @@ void ClientProxy1_0::handleWriteError()
 
 void ClientProxy1_0::handleFlatline()
 {
-  // didn't get a heartbeat fast enough.  assume client is dead.
-  LOG_DEBUG("client \"%s\" is dead", getName().c_str());
+  // 与客户端使用相同的原因码；记录配置阈值，不把未及时回复直接归因为网络丢包。
+  LOG_INFO(
+      "client \"%s\" disconnected: reason=keyboard-heartbeat-timeout timeout=%.1fs", getName().c_str(), m_heartbeatAlarm
+  );
   disconnect();
 }
 

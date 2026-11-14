@@ -9,6 +9,7 @@
 #include "net/FingerprintDatabase.h"
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDebug>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
@@ -135,13 +136,16 @@ struct PairedAudioControl::Impl
       Q_EMIT q->statusChanged(status);
     }
   }
-  void drop(QSslSocket *socket)
+  // 只记录关闭原因和套接字错误编号，不输出证书正文、会话参数或媒体密钥。
+  void drop(QSslSocket *socket, const char *reason = "invalid-control-frame")
   {
     auto it = sockets.find(socket);
     if (it == sockets.end())
       return;
     const auto id = it->id;
     const bool notify = it->ready && peers.value(id) == socket;
+    if (notify || !server || it->tlsVerified)
+      qInfo("audio-control reason=%s socket-error=%d", reason, static_cast<int>(socket->error()));
     if (notify)
       peers.remove(id);
     sockets.erase(it);
@@ -151,13 +155,13 @@ struct PairedAudioControl::Impl
     if (notify)
       Q_EMIT q->peerDisconnected(id);
   }
-  void stop()
+  void stop(const char *reason = "control-stopped")
   {
     active = false;
     listener.close();
     const auto all = sockets.keys();
     for (auto *socket : all)
-      drop(socket);
+      drop(socket, reason);
     nextConnect = 0;
   }
   bool loadIdentity()
@@ -199,7 +203,7 @@ struct PairedAudioControl::Impl
     if (newName.isEmpty() || newName.size() > 255 || newTrustPath.isEmpty())
       return false;
     if (active && (identity != newIdentity || trustPath != newTrustPath || localName != newName || localKey != key))
-      stop();
+      stop("identity-changed");
     localCertificate = cert;
     localKey = key;
     identity = newIdentity;
@@ -260,17 +264,24 @@ struct PairedAudioControl::Impl
       write(socket, {{QString::fromLatin1(kMarker), 1}, {QStringLiteral("name"), localName}});
     });
     QObject::connect(socket, &QSslSocket::readyRead, q, [this, socket] { read(socket); });
-    QObject::connect(socket, &QSslSocket::disconnected, q, [this, socket] { drop(socket); });
+    QObject::connect(socket, &QSslSocket::disconnected, q, [this, socket] { drop(socket, "socket-disconnected"); });
     QObject::connect(socket, &QSslSocket::errorOccurred, q, [this, socket](QAbstractSocket::SocketError) {
-      drop(socket);
+      drop(socket, "socket-error");
     });
   }
   bool write(QSslSocket *socket, const QJsonObject &object)
   {
     const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact) + '\n';
-    if (bytes.size() > kMaxFrame || socket->bytesToWrite() + bytes.size() > kMaxPendingWrite ||
-        socket->write(bytes) != bytes.size()) {
-      drop(socket);
+    if (bytes.size() > kMaxFrame) {
+      drop(socket, "oversized-control-frame");
+      return false;
+    }
+    if (socket->bytesToWrite() + bytes.size() > kMaxPendingWrite) {
+      drop(socket, "control-write-backpressure");
+      return false;
+    }
+    if (socket->write(bytes) != bytes.size()) {
+      drop(socket, "control-write-failed");
       return false;
     }
     return true;
@@ -280,8 +291,12 @@ struct PairedAudioControl::Impl
     auto it = sockets.find(socket);
     if (it == sockets.end())
       return;
-    if (!it->tlsVerified || !socket->isEncrypted() || !trusted(socket)) {
-      drop(socket);
+    if (!it->tlsVerified || !socket->isEncrypted()) {
+      drop(socket, "control-tls-unavailable");
+      return;
+    }
+    if (!trusted(socket)) {
+      drop(socket, "peer-trust-revoked");
       return;
     }
     // Read bounded pieces; a newline is mandatory and each complete frame is
@@ -324,7 +339,7 @@ struct PairedAudioControl::Impl
           const auto id = it->id;
           // Only a fully authenticated protocol-speaking socket replaces a peer.
           if (auto *previous = peers.value(id); previous && previous != socket)
-            drop(previous);
+            drop(previous, "authenticated-peer-replaced");
           it = sockets.find(socket);
           if (it == sockets.end())
             return;
@@ -364,7 +379,7 @@ struct PairedAudioControl::Impl
   void maintain()
   {
     if (!loadIdentity()) {
-      stop();
+      stop("identity-or-keyboard-unavailable");
       report(QStringLiteral("音频等待已验证的键鼠连接、原证书和设备信任"));
       return;
     }
@@ -375,9 +390,14 @@ struct PairedAudioControl::Impl
       const auto it = sockets.constFind(socket);
       if (it == sockets.cend())
         continue;
-      if ((!it->ready && now >= it->deadline) || (it->tlsVerified && !trusted(socket)) ||
-          (it->ready && now - it->lastSeen >= kPeerTimeoutMs) || (server && it->ready && !names.contains(it->name))) {
-        drop(socket);
+      // 分开记录四种失效条件，不能把身份撤销或键鼠门控误报为网络心跳超时。
+      const char *reason = !it->ready && now >= it->deadline                   ? "control-handshake-timeout"
+                           : it->tlsVerified && !trusted(socket)               ? "peer-trust-revoked"
+                           : it->ready && now - it->lastSeen >= kPeerTimeoutMs ? "control-heartbeat-timeout"
+                           : server && it->ready && !names.contains(it->name)  ? "keyboard-peer-disconnected"
+                                                                               : nullptr;
+      if (reason) {
+        drop(socket, reason);
         continue;
       }
       if (it->ready && now >= it->nextPing) {
@@ -422,7 +442,7 @@ void PairedAudioControl::configure(
 {
   const auto host = hostOnly(serverHost);
   if (d->server != server || d->keyboardReady != keyboardReady || d->host != host)
-    d->stop();
+    d->stop(keyboardReady ? "control-configuration-changed" : "keyboard-connection-unavailable");
   d->server = server;
   d->keyboardReady = keyboardReady;
   d->host = host;
@@ -435,7 +455,7 @@ void PairedAudioControl::send(const QString &id, const QJsonObject &message)
   if (!socket || message.contains(QString::fromLatin1(kMarker)) || message.contains(QString::fromLatin1(kHeartbeat)))
     return;
   if (!d->active || !socket->isEncrypted() || !d->trusted(socket)) {
-    d->drop(socket);
+    d->drop(socket, "peer-authorization-unavailable");
     return;
   }
   d->write(socket, message);

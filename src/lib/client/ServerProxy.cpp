@@ -326,7 +326,8 @@ ServerProxy::ConnectionResult ServerProxy::parseMessage(const uint8_t *code)
 
 void ServerProxy::handleKeepAliveAlarm()
 {
-  LOG_INFO("server is dead");
+  // 心跳超时只说明应用层未按时收到回复，可能来自网络或调度停顿，不能直接认定服务端宕机。
+  LOG_INFO("connection lost: reason=keyboard-heartbeat-timeout timeout=%.1fs", m_keepAliveAlarm);
   requestDisconnect("server is not responding");
 }
 
