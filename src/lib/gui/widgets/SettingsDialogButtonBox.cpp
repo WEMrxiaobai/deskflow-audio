@@ -52,6 +52,13 @@ void SettingsDialogButtonBox::enableSave(bool enable) const
   m_buttonBox->button(QDialogButtonBox::Save)->setEnabled(enable);
 }
 
+void SettingsDialogButtonBox::allowIndependentSave(bool allow)
+{
+  // 只开放保存入口，配置文件的重置、恢复默认和只读提示仍遵守配置权限。
+  m_independentSave = allow;
+  settingsWritableChanged(Settings::isWritable());
+}
+
 void SettingsDialogButtonBox::enableReset(bool enable) const
 {
   m_buttonBox->button(QDialogButtonBox::Reset)->setEnabled(enable);
@@ -91,7 +98,7 @@ void SettingsDialogButtonBox::settingsWritableChanged(bool writable)
 
   m_lblIcon->setVisible(!writable);
   m_lblText->setVisible(!writable);
-  m_buttonBox->button(QDialogButtonBox::Save)->setVisible(writable);
+  m_buttonBox->button(QDialogButtonBox::Save)->setVisible(writable || m_independentSave);
   m_buttonBox->button(QDialogButtonBox::Reset)->setVisible(writable);
   m_buttonBox->button(QDialogButtonBox::RestoreDefaults)->setVisible(writable);
 }

@@ -13,6 +13,9 @@ namespace deskflow::gui::TlsUtility {
 
 bool generateCertificate();
 
+/// 按待保存的路径和密钥长度生成证书，不提前改写 Settings；供设置窗口提交时使用。
+bool generateCertificate(const QString &certPath, int keyLength);
+
 /**
  * @brief Checks the settings values Settings::Security::TlsEnabled
  * @return true when tls is enabled

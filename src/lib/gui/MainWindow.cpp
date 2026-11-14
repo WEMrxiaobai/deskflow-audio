@@ -489,6 +489,9 @@ void MainWindow::openSettings()
 
   connect(&dialog, &SettingsDialog::requestRemoveAllSettings, this, &MainWindow::clearSettings, Qt::UniqueConnection);
   if (dialog.exec() == QDialog::Accepted) {
+    // 登录启动项直接写入当前用户注册表，不是 core 配置；只改它时保持现有键鼠连接和音频会话。
+    if (!dialog.coreSettingsChanged())
+      return;
     Settings::save();
     disconnect(&dialog, &SettingsDialog::requestRemoveAllSettings, nullptr, nullptr);
 

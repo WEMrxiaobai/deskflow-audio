@@ -92,6 +92,10 @@ This section contains options used by the daemon on windows it will begin with `
 
 ### GUI
 
+On Windows, **Settings > General > Start Deskflow when I sign in to Windows** registers the current GUI executable for the current user. This is separate from `startCoreWithGui` and the Windows service setting. The checkbox reads the actual `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value named `Deskflow`; no duplicate INI preference is stored. Save verifies the registration, and changing only this option does not restart the Core.
+
+The **Open Windows startup apps** button opens the system startup settings. A registered entry can still be disabled there; the application does not override that decision. To run without a visible window, also choose **Window > When the application starts > Send to background**. Keyboard/mouse sharing resumes according to the existing Core settings. Portable users should keep the application in a fixed location; after moving it, open the new copy and save the startup option to repair the path. Disable this option before removing the application.
+
 This section contains options used by the GUI it will begin with `[gui]`
 
 |Option                          | Valid Values      |Description|

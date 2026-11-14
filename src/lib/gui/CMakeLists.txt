@@ -33,6 +33,8 @@ add_library(${target} STATIC
   TlsUtility.h
   VersionChecker.cpp
   VersionChecker.h
+  WindowsAutoStart.cpp
+  WindowsAutoStart.h
   config/ComputerConfig.h
   config/Computer.cpp
   config/Computer.h

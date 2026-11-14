@@ -79,6 +79,33 @@
         </layout>
        </item>
        <item>
+        <widget class="QWidget" name="startupWidget" native="true">
+         <layout class="QVBoxLayout" name="startupLayout">
+          <property name="leftMargin"><number>0</number></property>
+          <property name="topMargin"><number>0</number></property>
+          <property name="rightMargin"><number>0</number></property>
+          <property name="bottomMargin"><number>0</number></property>
+          <item>
+           <widget class="QCheckBox" name="cbStartAtLogin">
+            <property name="text"><string>Start Deskflow when I sign in to Windows</string></property>
+            <property name="toolTip"><string>Starts this application for the current user. Window visibility and keyboard/mouse sharing follow the existing settings. Keep portable application files in a fixed location.</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="lblStartupStatus">
+            <property name="wordWrap"><bool>true</bool></property>
+            <property name="text"><string/></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="btnWindowsStartup">
+            <property name="text"><string>Open Windows startup apps</string></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
         <widget class="QCheckBox" name="cbAutoUpdate">
          <property name="text">
           <string>Check for updates on startup</string>

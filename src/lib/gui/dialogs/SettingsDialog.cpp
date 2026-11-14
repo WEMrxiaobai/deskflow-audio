@@ -18,17 +18,22 @@
 #include "gui/widgets/SettingsDialogButtonBox.h"
 
 #include <QComboBox>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QSignalBlocker>
+#include <QUrl>
+#include <utility>
 
 using namespace deskflow::gui;
 
-SettingsDialog::SettingsDialog(QWidget *parent, const ServerConfig &serverConfig)
+SettingsDialog::SettingsDialog(QWidget *parent, const ServerConfig &serverConfig, WindowsAutoStart autoStart)
     : QDialog(parent),
       ui{std::make_unique<Ui::SettingsDialog>()},
       m_serverConfig(serverConfig),
-      m_buttonBox{new SettingsDialogButtonBox(this)}
+      m_buttonBox{new SettingsDialogButtonBox(this)},
+      m_autoStart(std::move(autoStart))
 {
 
   ui->setupUi(this);
@@ -94,8 +99,18 @@ void SettingsDialog::changeEvent(QEvent *e)
   }
 }
 
-void SettingsDialog::initConnections() const
+void SettingsDialog::initConnections()
 {
+  // 系统页面由用户主动打开；失败时给出明确提示，不修改 StartupApproved 等系统内部状态。
+  connect(ui->btnWindowsStartup, &QPushButton::clicked, this, [this] {
+    if (!QDesktopServices::openUrl(QUrl(QStringLiteral("ms-settings:startupapps")))) {
+      QMessageBox::warning(
+          this, tr("Windows startup"),
+          tr("Unable to open Windows settings. Open Settings > Apps > Startup and check Deskflow.")
+      );
+    }
+  });
+  connect(ui->cbStartAtLogin, &QCheckBox::toggled, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(m_buttonBox, &SettingsDialogButtonBox::accepted, this, &SettingsDialog::accept);
   connect(m_buttonBox, &SettingsDialogButtonBox::rejected, this, &QDialog::reject);
   connect(m_buttonBox, &SettingsDialogButtonBox::reset, this, &SettingsDialog::loadFromConfig);
@@ -108,7 +123,6 @@ void SettingsDialog::initConnections() const
   connect(ui->groupService, &QGroupBox::toggled, this, &SettingsDialog::updateControls);
   connect(ui->btnClearAllSettings, &QPushButton::clicked, this, &SettingsDialog::resetAllSettings);
   connect(ui->btnTlsRegenCert, &QPushButton::clicked, this, &SettingsDialog::regenCertificates);
-  connect(ui->comboTlsKeyLength, &QComboBox::currentIndexChanged, this, &SettingsDialog::updateRequestedKeySize);
   connect(ui->btnTlsCertPath, &QPushButton::clicked, this, &SettingsDialog::browseCertificatePath);
   connect(ui->btnBrowseLog, &QPushButton::clicked, this, &SettingsDialog::browseLogPath);
   connect(ui->groupLogToFile, &QGroupBox::toggled, this, &SettingsDialog::setLogToFile);
@@ -147,11 +161,10 @@ void SettingsDialog::initConnections() const
 
 void SettingsDialog::regenCertificates()
 {
-  if (TlsUtility::generateCertificate()) {
-    QMessageBox::information(this, tr("TLS Certificate Regenerated"), tr("TLS certificate regenerated successfully."));
-    const auto certificate = Settings::value(Settings::Security::Certificate).toString();
-    updateKeyLengthOnFile(certificate);
-  }
+  // 与密钥长度选择一起延迟到保存：选择、取消、重置均不能提前生成证书并影响运行中的 core。
+  m_regenerateCertificate = true;
+  updateText();
+  setButtonBoxEnabledButtons();
 }
 
 void SettingsDialog::browseCertificatePath()
@@ -200,6 +213,9 @@ void SettingsDialog::resetAllSettings()
 
 void SettingsDialog::updateText()
 {
+  ui->btnTlsRegenCert->setText(m_regenerateCertificate ? tr("Regenerate on save") : tr("Regenerate certificate"));
+  if (m_regenerateCertificate)
+    ui->lblTlsCertInfo->setToolTip(tr("The TLS certificate will be regenerated when saving."));
   const auto logLevels = LogLevel::logLevelNames().count();
   const QStringList toolTips = {tr("Required messages"),        tr("Non-fatal errors"), tr("General warnings"),
                                 tr("General events [Default]"), tr("Debug entries"),    tr("Verbose debug output")};
@@ -216,10 +232,39 @@ void SettingsDialog::updateText()
       ui->comboLogLevel->setItemData(i, toolTips.at(i), Qt::ToolTipRole);
     }
   }
+  updateAutoStartText();
 }
 
 void SettingsDialog::accept()
 {
+  // 必须先注册并验证登录入口，再保存其他设置。失败保留对话框，避免用户误以为已经生效。
+  const bool startupChanged = deskflow::platform::isWindows() && m_autoStartState.writable &&
+                              (ui->cbStartAtLogin->isChecked() != m_autoStartState.registered ||
+                               (ui->cbStartAtLogin->isChecked() && !m_autoStartState.currentExecutable));
+  if (startupChanged) {
+    const auto error = m_autoStart.setEnabled(ui->cbStartAtLogin->isChecked());
+    if (!error.isEmpty()) {
+      QMessageBox::warning(this, tr("Windows startup"), error);
+      return;
+    }
+    m_autoStartState = m_autoStart.state();
+    updateAutoStartText();
+  }
+
+  // 单独修改登录启动时不触碰共享配置；主窗口也不能因此重启 core。
+  // 保存时重新检查配置权限；只读配置下仅提交独立启动项，不写配置、不生成证书。
+  const bool configChanged = Settings::isWritable() && isConfigModified();
+  if (!configChanged) {
+    QDialog::accept();
+    return;
+  }
+  if (m_regenerateCertificate &&
+      !TlsUtility::generateCertificate(ui->lineTlsCertPath->text(), ui->comboTlsKeyLength->currentText().toInt())) {
+    QMessageBox::warning(this, tr("TLS Certificate"), tr("Unable to regenerate the TLS certificate."));
+    return;
+  }
+  m_coreSettingsChanged = true;
+
   Settings::setValue(Settings::Core::Port, ui->sbPort->value());
   Settings::setValue(Settings::Core::Interface, ui->comboInterface->currentData());
   Settings::setValue(Settings::Log::Level, ui->comboLogLevel->currentData());
@@ -229,12 +274,25 @@ void SettingsDialog::accept()
   Settings::setValue(Settings::Gui::Autohide, ui->rbAutoHide->isChecked());
   Settings::setValue(Settings::Gui::AutoUpdateCheck, ui->cbAutoUpdate->isChecked());
   Settings::setValue(Settings::Core::PreventSleep, ui->cbPreventSleep->isChecked());
-  Settings::setValue(Settings::Security::Certificate, ui->lineTlsCertPath->text());
-  Settings::setValue(Settings::Security::KeySize, ui->comboTlsKeyLength->currentText().toInt());
-  Settings::setValue(Settings::Security::TlsEnabled, ui->groupSecurity->isChecked());
+  const bool tlsChanged =
+      m_regenerateCertificate ||
+      ui->lineTlsCertPath->text() != Settings::value(Settings::Security::Certificate).toString() ||
+      ui->comboTlsKeyLength->currentText().toInt() != Settings::value(Settings::Security::KeySize).toInt() ||
+      ui->groupSecurity->isChecked() != Settings::value(Settings::Security::TlsEnabled).toBool() ||
+      ui->cbRequireClientCert->isChecked() != Settings::value(Settings::Security::CheckPeers).toBool();
+  {
+    // TLS 字段作为一组提交后再通知主窗口，防止它在路径/密钥长度只更新一半时生成错误证书。
+    const QSignalBlocker blocker(Settings::instance());
+    Settings::setValue(Settings::Security::Certificate, ui->lineTlsCertPath->text());
+    Settings::setValue(Settings::Security::KeySize, ui->comboTlsKeyLength->currentText().toInt());
+    Settings::setValue(Settings::Security::TlsEnabled, ui->groupSecurity->isChecked());
+    Settings::setValue(Settings::Security::CheckPeers, ui->cbRequireClientCert->isChecked());
+  }
+  // 即使重新生成使用同一路径、同一长度，也必须刷新主窗口指纹，并在确认保存后应用 core。
+  if (tlsChanged)
+    Q_EMIT Settings::instance()->settingsChanged(Settings::Security::Certificate);
   Settings::setValue(Settings::Gui::CloseToTray, ui->rbCloseToTray->isChecked());
   Settings::setValue(Settings::Gui::SymbolicTrayIcon, ui->rbIconMono->isChecked());
-  Settings::setValue(Settings::Security::CheckPeers, ui->cbRequireClientCert->isChecked());
   Settings::setValue(Settings::Core::Language, I18N::nativeTo639Name(ui->comboLanguage->currentText()));
   Settings::setValue(Settings::Log::GuiDebug, ui->cbGuiDebug->isChecked());
   Settings::setValue(Settings::Gui::ShowVersionInTitle, ui->cbShowVersion->isChecked());
@@ -255,6 +313,10 @@ void SettingsDialog::accept()
 
 void SettingsDialog::loadFromConfig()
 {
+  // 重置只撤销未保存的证书生成请求，当前配置和磁盘证书均保持原样。
+  m_regenerateCertificate = false;
+  updateText();
+  loadAutoStart();
   ui->sbPort->setValue(Settings::value(Settings::Core::Port).toInt());
   ui->comboLogLevel->setCurrentIndex(
       ui->comboLogLevel->findData(Settings::logLevelText(), Qt::UserRole, Qt::MatchFixedString)
@@ -307,8 +369,46 @@ void SettingsDialog::loadFromConfig()
   updateControls();
 }
 
+void SettingsDialog::loadAutoStart()
+{
+  // 启动项的唯一事实来源是系统注册表；不在 Deskflow 配置里维护第二份易失真的布尔值。
+  const bool supported = deskflow::platform::isWindows();
+  ui->startupWidget->setVisible(supported);
+  if (!supported)
+    return;
+  m_autoStartState = m_autoStart.state();
+  ui->cbStartAtLogin->setChecked(m_autoStartState.registered);
+  m_buttonBox->allowIndependentSave(m_autoStartState.writable);
+  updateAutoStartText();
+}
+
+void SettingsDialog::updateAutoStartText()
+{
+  // retranslateUi 会清空动态标签；重新翻译状态文案，保留复选框的未保存选择。
+  if (!m_autoStartState.error.isEmpty()) {
+    ui->lblStartupStatus->setText(m_autoStartState.error);
+  } else if (!m_autoStartState.writable) {
+    ui->lblStartupStatus->setText(tr("The Windows startup entry is read only."));
+  } else if (!m_autoStartState.registered) {
+    ui->lblStartupStatus->setText(tr("Not registered for Windows login."));
+  } else if (!m_autoStartState.currentExecutable) {
+    ui->lblStartupStatus->setText(tr("The startup entry points to another location. Save to use this application."));
+  } else {
+    // Run 注册成功不等同于 Windows 已允许执行；禁用状态由系统管理，禁止静默覆盖用户选择。
+    ui->lblStartupStatus->setText(
+        tr("Registered. If it does not start at login, enable Deskflow in Windows startup apps.")
+    );
+  }
+}
+
+bool SettingsDialog::coreSettingsChanged() const
+{
+  return m_coreSettingsChanged;
+}
+
 void SettingsDialog::updateTlsControls()
 {
+  ui->lblTlsCertInfo->setToolTip({});
   const auto certificate = Settings::value(Settings::Security::Certificate).toString();
   if (QFile(certificate).exists()) {
     updateKeyLengthOnFile(certificate);
@@ -323,6 +423,8 @@ void SettingsDialog::updateTlsControls()
   ui->groupSecurity->setEnabled(Settings::isWritable());
 
   updateTlsControlsEnabled();
+  if (m_regenerateCertificate)
+    ui->lblTlsCertInfo->setToolTip(tr("The TLS certificate will be regenerated when saving."));
 }
 
 void SettingsDialog::updateTlsControlsEnabled()
@@ -381,6 +483,8 @@ void SettingsDialog::updateControls()
   ui->rbShowOnStart->setEnabled(writable);
   ui->btnClearAllSettings->setEnabled(writable);
   ui->cbAutoUpdate->setEnabled(writable);
+  // HKCU Run 与 INI 配置是两套权限；只读便携配置不能阻止管理当前用户启动项。
+  ui->cbStartAtLogin->setEnabled(m_autoStartState.writable && m_autoStartState.error.isEmpty());
   ui->cbPreventSleep->setEnabled(writable);
   ui->lineTlsCertPath->setEnabled(writable);
   ui->comboTlsKeyLength->setEnabled(writable);
@@ -403,13 +507,7 @@ void SettingsDialog::updateControls()
   ui->widgetLogFilename->setEnabled(writable && logToFile);
 
   updateTlsControls();
-}
-
-void SettingsDialog::updateRequestedKeySize() const
-{
-  if (ui->comboTlsKeyLength->currentText() == Settings::value(Settings::Security::KeySize).toString())
-    return;
-  Settings::setValue(Settings::Security::KeySize, ui->comboTlsKeyLength->currentText());
+  setButtonBoxEnabledButtons();
 }
 
 void SettingsDialog::logLevelChanged()
@@ -419,13 +517,25 @@ void SettingsDialog::logLevelChanged()
 
 bool SettingsDialog::isModified() const
 {
+  // 旧路径也算需要保存，使移动便携目录或切换安装位置后能够显式修复。
+  const bool startupModified =
+      deskflow::platform::isWindows() && (ui->cbStartAtLogin->isChecked() != m_autoStartState.registered ||
+                                          (ui->cbStartAtLogin->isChecked() && !m_autoStartState.currentExecutable));
+  return (m_autoStartState.writable && startupModified) || (Settings::isWritable() && isConfigModified());
+}
+
+bool SettingsDialog::isConfigModified() const
+{
   const auto processMode = Settings::value(Settings::Core::ProcessMode).value<Settings::ProcessMode>();
   const bool ignoreInterface = !m_interfaceSetOnLoad && (ui->comboInterface->currentIndex() == 0);
 
+  // 默认枚举可序列化为 Info，选项数据为 INFO；大小写不同不能被误判成用户修改后重启 core。
+  const bool logLevelModified =
+      ui->comboLogLevel->currentData().toString().compare(Settings::logLevelText(), Qt::CaseInsensitive) != 0;
+
   bool modified =
-      (ui->sbPort->value() != Settings::value(Settings::Core::Port).toInt()) ||
-      (ui->comboLogLevel->currentData() != Settings::logLevelText()) ||
-      (ui->groupLogToFile->isChecked() != Settings::value(Settings::Log::ToFile).toBool()) ||
+      m_regenerateCertificate || (ui->sbPort->value() != Settings::value(Settings::Core::Port).toInt()) ||
+      logLevelModified || (ui->groupLogToFile->isChecked() != Settings::value(Settings::Log::ToFile).toBool()) ||
       (ui->lineLogFilename->text() != Settings::value(Settings::Log::File).toString()) ||
       (ui->rbAutoHide->isChecked() != Settings::value(Settings::Gui::Autohide).toBool()) ||
       (ui->cbPreventSleep->isChecked() != Settings::value(Settings::Core::PreventSleep).toBool()) ||
@@ -458,6 +568,7 @@ bool SettingsDialog::isDefault() const
       static_cast<int>(LogLevel::fromOption(Settings::defaultValue(Settings::Log::Level).toString()));
 
   return (
+      !m_regenerateCertificate && (!deskflow::platform::isWindows() || !ui->cbStartAtLogin->isChecked()) &&
       (ui->sbPort->value() == Settings::defaultValue(Settings::Core::Port).toInt()) &&
       (ui->comboLogLevel->currentIndex() == logLevelIndex) &&
       (ui->groupLogToFile->isChecked() == Settings::defaultValue(Settings::Log::ToFile).toBool()) &&
@@ -486,6 +597,10 @@ bool SettingsDialog::isDefault() const
 
 void SettingsDialog::resetToDefault()
 {
+  m_regenerateCertificate = false;
+  updateText();
+  // 恢复默认只修改界面，默认不注册登录启动；用户确认保存前不能改变系统启动项。
+  ui->cbStartAtLogin->setChecked(false);
   ui->sbPort->setValue(Settings::defaultValue(Settings::Core::Port).toInt());
   ui->comboLogLevel->setCurrentIndex(
       static_cast<int>(LogLevel::fromOption(Settings::defaultValue(Settings::Log::Level).toString()))

@@ -1102,6 +1102,58 @@ Enabling this setting will disable the server config GUI.</source>
 <context>
     <name>SettingsDialog</name>
     <message>
+        <source>The Windows startup entry is read only.</source>
+        <translation>当前用户启动项只读，无法修改。</translation>
+    </message>
+    <message>
+        <source>Regenerate on save</source>
+        <translation>保存时重新生成</translation>
+    </message>
+    <message>
+        <source>The TLS certificate will be regenerated when saving.</source>
+        <translation>保存设置时将重新生成 TLS 证书。</translation>
+    </message>
+    <message>
+        <source>TLS Certificate</source>
+        <translation>TLS 证书</translation>
+    </message>
+    <message>
+        <source>Unable to regenerate the TLS certificate.</source>
+        <translation>无法重新生成 TLS 证书，请检查证书路径及写入权限。</translation>
+    </message>
+    <message>
+        <source>Start Deskflow when I sign in to Windows</source>
+        <translation>登录 Windows 时启动 Deskflow</translation>
+    </message>
+    <message>
+        <source>Starts this application for the current user. Window visibility and keyboard/mouse sharing follow the existing settings. Keep portable application files in a fixed location.</source>
+        <translation>为当前用户启动此应用，窗口显示和键鼠共享沿用已有设置。便携版请保持程序文件位置固定。</translation>
+    </message>
+    <message>
+        <source>Open Windows startup apps</source>
+        <translation>打开 Windows 启动应用设置</translation>
+    </message>
+    <message>
+        <source>Windows startup</source>
+        <translation>Windows 登录启动</translation>
+    </message>
+    <message>
+        <source>Unable to open Windows settings. Open Settings &gt; Apps &gt; Startup and check Deskflow.</source>
+        <translation>无法打开 Windows 设置。请手动打开“设置 → 应用 → 启动”，检查 Deskflow。</translation>
+    </message>
+    <message>
+        <source>Not registered for Windows login.</source>
+        <translation>尚未注册 Windows 登录启动。</translation>
+    </message>
+    <message>
+        <source>The startup entry points to another location. Save to use this application.</source>
+        <translation>启动项指向其他位置。保存后将使用当前应用路径。</translation>
+    </message>
+    <message>
+        <source>Registered. If it does not start at login, enable Deskflow in Windows startup apps.</source>
+        <translation>已注册。如果登录后没有启动，请在 Windows 启动应用设置中启用 Deskflow。</translation>
+    </message>
+    <message>
         <source>Preferences</source>
         <translation>首选项</translation>
     </message>
@@ -1433,6 +1485,29 @@ Enabling this setting will disable the server config GUI.</source>
     <message>
         <source>A computer with this name already exists</source>
         <translation type="unfinished">一台同名的计算机已经存在</translation>
+    </message>
+</context>
+<context>
+    <name>WindowsAutoStart</name>
+    <message>
+        <source>Unable to read the Windows startup entry.</source>
+        <translation>无法读取 Windows 启动项。</translation>
+    </message>
+    <message>
+        <source>The application path is invalid or too long for Windows startup.</source>
+        <translation>应用路径无效，或超出 Windows 启动项允许的长度。</translation>
+    </message>
+    <message>
+        <source>Unable to save the Windows startup entry.</source>
+        <translation>无法保存 Windows 启动项，请检查当前用户的权限或系统限制。</translation>
+    </message>
+    <message>
+        <source>The Windows startup entry could not be verified.</source>
+        <translation>无法确认 Windows 启动项已保存，请重新打开设置检查。</translation>
+    </message>
+    <message>
+        <source>Windows startup is unavailable on this platform.</source>
+        <translation>当前平台不支持 Windows 登录启动。</translation>
     </message>
 </context>
 </TS>

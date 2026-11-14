@@ -100,13 +100,20 @@ QByteArray certFingerprint(const QString &certPath)
 
 bool generateCertificate()
 {
+  // 原调用方继续使用已生效配置；设置窗口可传入尚未提交的值，避免选择阶段产生副作用。
+  return generateCertificate(
+      Settings::value(Settings::Security::Certificate).toString(), Settings::value(Settings::Security::KeySize).toInt()
+  );
+}
+
+bool generateCertificate(const QString &certPath, int requestedKeyLength)
+{
   qDebug(
       "generating tls certificate, "
       "all clients must trust the new fingerprint"
   );
 
-  const auto keyLength = std::max(2048, Settings::value(Settings::Security::KeySize).toInt());
-  const auto certPath = Settings::value(Settings::Security::Certificate).toString();
+  const auto keyLength = std::max(2048, requestedKeyLength);
 
   QFileInfo info(certPath);
   if (QDir dir(info.absolutePath()); !dir.exists() && !dir.mkpath(".")) {
