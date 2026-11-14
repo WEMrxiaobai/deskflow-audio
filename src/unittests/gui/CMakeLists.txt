@@ -4,6 +4,20 @@
 add_subdirectory(config)
 add_subdirectory(core)
 
+# 使用独立输出目录中的临时便携配置，覆盖名称校验、旧布局保存和桌面/服务模式启动拦截。
+create_test(
+  NAME ServerConfigurationValidationTests
+  DEPENDS gui
+  SOURCE ServerConfigurationValidationTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
+)
+target_compile_options(ServerConfigurationValidationTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+# 对话框头文件沿用 GUI 内部的相对包含路径；测试在独立目录编译，需显式补充 GUI 根目录。
+target_include_directories(ServerConfigurationValidationTests PRIVATE "${CMAKE_SOURCE_DIR}/src/lib/gui")
+set_target_properties(ServerConfigurationValidationTests PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/configuration-validation")
+set_tests_properties(ServerConfigurationValidationTests PROPERTIES TIMEOUT 30 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 if(WIN32)
   # 使用随机注册表测试子键和独立配置，覆盖真实设置窗口，不改机器上的登录启动项。
   create_test(

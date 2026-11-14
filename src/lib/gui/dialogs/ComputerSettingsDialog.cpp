@@ -82,7 +82,9 @@ void ComputerSettingsDialog::accept()
     );
     return;
   }
-  if (!ui->lblNameError->text().isEmpty()) {
+  // setText 在安装 validator 前执行，旧配置的非法名称可能尚未触发错误标签刷新。
+  // 保存时强制调用真实校验，避免仅凭空标签把中文占位名再次写回布局。
+  if (!ui->lineNameEdit->hasAcceptableInput()) {
     return;
   }
 

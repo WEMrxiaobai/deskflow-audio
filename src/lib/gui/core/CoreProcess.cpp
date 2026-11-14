@@ -388,6 +388,20 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
 
   QMutexLocker locker(&m_processMutex);
 
+  // 在创建进程、连接守护进程和写入配置文件之前校验内置布局。
+  // 错误名称不会随着应用启动再次落盘，也不会进入守护进程的无限启动重试。
+  m_serverConfigError.clear();
+  if (m_mode == Settings::CoreMode::Server && !Settings::value(Settings::Server::ExternalConfig).toBool()) {
+    m_serverConfigError = m_serverConfig.validationError();
+    if (!m_serverConfigError.isEmpty()) {
+      qCritical().noquote() << "not starting core, invalid server configuration:" << m_serverConfigError;
+      setProcessState(ProcessState::Stopped);
+      setConnectionState(ConnectionState::Disconnected);
+      Q_EMIT error(Error::InvalidServerConfig);
+      return;
+    }
+  }
+
   const auto currentMode = Settings::value(Settings::Core::ProcessMode).value<ProcessMode>();
   const auto processMode = processModeOption.value_or(currentMode);
   const auto coreMode = QVariant::fromValue(m_mode).toString().toLower();

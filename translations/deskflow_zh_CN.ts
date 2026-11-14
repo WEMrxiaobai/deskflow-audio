@@ -483,6 +483,10 @@ Do you want to connect to the server?
 <context>
     <name>MainWindow</name>
     <message>
+        <source>Invalid server configuration</source>
+        <translation>服务端配置无效</translation>
+    </message>
+    <message>
         <source>This computer&apos;s name:</source>
         <translation>此计算机名称：</translation>
     </message>
@@ -945,6 +949,10 @@ Additionally, check you are able to %1 the server config file: %2</source>
 </context>
 <context>
     <name>ServerConfigDialog</name>
+    <message>
+        <source>Invalid server configuration</source>
+        <translation>服务端配置无效</translation>
+    </message>
     <message>
         <source>Server Configuration</source>
         <translation>服务器配置</translation>
@@ -1508,6 +1516,17 @@ Enabling this setting will disable the server config GUI.</source>
     <message>
         <source>Windows startup is unavailable on this platform.</source>
         <translation>当前平台不支持 Windows 登录启动。</translation>
+    </message>
+</context>
+<context>
+    <name>ServerConfig</name>
+    <message>
+        <source>Invalid computer name or alias "%1". Use 1-255 ASCII letters, digits, underscores, dots and internal hyphens. Enter the name shown on the other computer.</source>
+        <translation>计算机名称或别名“%1”无效。请输入 1–255 个英文字母、数字、下划线、句点或位于名称段内部的连字符，并确保名称与另一台电脑显示的一致。</translation>
+    </message>
+    <message>
+        <source>Duplicate computer name or alias "%1".</source>
+        <translation>计算机名称或别名“%1”重复，名称匹配不区分大小写。</translation>
     </message>
 </context>
 </TS>

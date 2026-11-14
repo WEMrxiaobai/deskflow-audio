@@ -35,6 +35,7 @@ public:
   enum class Error
   {
     AddressMissing,
+    InvalidServerConfig,
     StartFailed
   };
 
@@ -60,6 +61,11 @@ public:
   bool isStarted() const
   {
     return m_processState == ProcessState::Started;
+  }
+  /// 保留本次启动前校验的具体错误，界面据此提示名称问题，而不是误导用户检查运行权限。
+  QString serverConfigError() const
+  {
+    return m_serverConfigError;
   }
   ProcessState processState() const
   {
@@ -122,6 +128,7 @@ private:
 
   const ServerConfig &m_serverConfig;
   QString m_address;
+  QString m_serverConfigError;
   ProcessState m_processState = ProcessState::Stopped;
   ConnectionState m_connectionState = ConnectionState::Disconnected;
   Settings::CoreMode m_mode = Settings::CoreMode::None;

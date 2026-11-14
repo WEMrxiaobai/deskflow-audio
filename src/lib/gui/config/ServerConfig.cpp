@@ -8,11 +8,14 @@
 
 #include "ServerConfig.h"
 
+#include "common/ComputerName.h"
 #include "common/Hotkey.h"
 #include "common/Settings.h"
 
 #include <QAbstractButton>
+#include <QCoreApplication>
 #include <QPushButton>
+#include <QSet>
 
 using enum ComputerConfig::SwitchCorner;
 using enum ComputerConfig::Fix;
@@ -39,6 +42,11 @@ ServerConfig::ServerConfig(int columns, int rows) : m_computers(columns), m_colu
 
 bool ServerConfig::save(const QString &fileName) const
 {
+  // 导出配置也必须先校验；失败时不打开目标文件，保留此前可用的配置内容。
+  if (const auto error = validationError(); !error.isEmpty()) {
+    qWarning().noquote() << error;
+    return false;
+  }
   QFile file(fileName);
   if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
     return false;
@@ -47,6 +55,34 @@ bool ServerConfig::save(const QString &fileName) const
   file.close();
 
   return true;
+}
+
+QString ServerConfig::validationError() const
+{
+  // 空格位表示未放置电脑，不能当作空名称报错；所有实际电脑和别名共享同一命名空间。
+  QSet<QString> usedNames;
+  for (const auto &computer : m_computers) {
+    if (computer.isNull())
+      continue;
+    QStringList names = {computer.name()};
+    names.append(computer.aliases());
+    for (const auto &name : names) {
+      if (!deskflow::isValidComputerName(name.toStdString())) {
+        return QCoreApplication::translate(
+                   "ServerConfig", "Invalid computer name or alias \"%1\". Use 1-255 ASCII letters, digits, "
+                                   "underscores, dots and internal hyphens. Enter the name shown on the other computer."
+        )
+            .arg(name);
+      }
+      // core 按不区分大小写匹配设备；跨电脑名称、别名重复都会让连接映射不明确。
+      const auto key = name.toLower();
+      if (usedNames.contains(key)) {
+        return QCoreApplication::translate("ServerConfig", "Duplicate computer name or alias \"%1\".").arg(name);
+      }
+      usedNames.insert(key);
+    }
+  }
+  return {};
 }
 
 bool ServerConfig::operator==(const ServerConfig &sc) const

@@ -46,6 +46,8 @@ public:
   }
 
   bool save(const QString &fileName) const;
+  /// 返回布局的首个名称错误；保存和启动均调用，空字符串表示校验通过。
+  QString validationError() const;
   bool computerExists(const QString &computerName) const;
   void save(QFile &file) const;
   bool isFull() const;

@@ -404,6 +404,10 @@ void MainWindow::coreProcessError(CoreProcess::Error error)
     QMessageBox::warning(
         this, tr("Address missing"), tr("Please enter the hostname or IP address of the other computer.")
     );
+  } else if (error == CoreProcess::Error::InvalidServerConfig) {
+    // 名称错误可由用户修正布局恢复，不能沿用“权限不足”的通用启动失败提示。
+    show();
+    QMessageBox::warning(this, tr("Invalid server configuration"), m_coreProcess.serverConfigError());
   } else if (error == CoreProcess::Error::StartFailed) {
     show();
     auto message = tr("The Core executable could not be started.\n"

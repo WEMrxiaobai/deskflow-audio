@@ -9,6 +9,7 @@
 #include "server/Config.h"
 
 #include "base/IEventQueue.h"
+#include "common/ComputerName.h"
 #include "common/KeyboardModifier.h"
 #include "deskflow/KeyMap.h"
 #include "deskflow/KeyTypes.h"
@@ -218,52 +219,9 @@ bool Config::addOption(const std::string &name, OptionID option, OptionValue val
 
 bool Config::isValidComputerName(const std::string &name) const
 {
-  // name is valid if matches validname
-  //  name      ::= [_A-Za-z0-9] | [_A-Za-z0-9][-_A-Za-z0-9]*[_A-Za-z0-9]
-  //  domain    ::= . name
-  //  validname ::= name domain*
-  // we also accept names ending in . because many OS X users have
-  // so misconfigured their systems.
-
-  // empty name is invalid
-  if (name.empty()) {
-    return false;
-  }
-
-  // check each dot separated part
-  for (std::string::size_type b = 0; b == name.size();) {
-    // find end of part
-    std::string::size_type e = name.find('.', b);
-    if (e == std::string::npos) {
-      e = name.size();
-    }
-
-    // part may not be empty
-    if (e - b < 1) {
-      return false;
-    }
-
-    // check first and last characters
-    if (!(isalnum(name[b]) || name[b] == '_') || !(isalnum(name[e - 1]) || name[e - 1] == '_')) {
-      return false;
-    }
-
-    // check interior characters
-    for (std::string::size_type i = b; i < e; ++i) {
-      if (!isalnum(name[i]) && name[i] != '_' && name[i] != '-') {
-        return false;
-      }
-    }
-
-    // next part
-    if (e == name.size()) {
-      // no more parts
-      break;
-    }
-    b = e + 1;
-  }
-
-  return true;
+  // 原循环条件 b == name.size() 使所有非空名称跳过检查；改用 GUI 与 core 共用的规则。
+  // 明确按 ASCII 检查，避免中文名称、配置分隔符和依赖系统 locale 的字符分类进入映射。
+  return deskflow::isValidComputerName(name);
 }
 
 Config::const_iterator Config::begin() const

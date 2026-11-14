@@ -60,6 +60,14 @@ bool ServerConfigDialog::addClient(const QString &clientName)
 
 void ServerConfigDialog::save()
 {
+  // 必须在覆盖主窗口布局及写入任何设置前检查；旧版本留下的中文占位名也要明确拦截。
+  // 外部配置模式不使用本布局，不能让未启用的旧布局阻止用户选择外部配置。
+  if (!ui->groupExternalConfig->isChecked()) {
+    if (const auto error = serverConfig().validationError(); !error.isEmpty()) {
+      QMessageBox::warning(this, tr("Invalid server configuration"), error);
+      return;
+    }
+  }
   if (ui->groupExternalConfig->isChecked() && !QFile::exists(ui->lineConfigFile->text())) {
 
     auto selectedButton = QMessageBox::warning(
