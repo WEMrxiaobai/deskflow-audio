@@ -125,13 +125,16 @@ struct DirectPackets
 {
   codec::OpusCodec codec{240};
   transport::SrtpSender sender{config(), key()};
-  Bytes packet(std::uint16_t sequence)
+  // 可指定扩展序号对应的媒体时间戳，用于序号回绕而媒体时间线连续的回归。
+  Bytes packet(std::uint16_t sequence, std::optional<std::uint32_t> timestamp = std::nullopt)
   {
     std::array<std::uint8_t, transport::kMaxPayloadBytes> encoded{};
     const auto count = codec.encode(tone(0.1f), encoded);
     require(count > 0, "Test Opus encode failed");
-    const auto result =
-        sender.protect(std::span<const std::uint8_t>(encoded.data(), count), sequence, std::uint32_t(sequence) * 240);
+    const auto result = sender.protect(
+        std::span<const std::uint8_t>(encoded.data(), count), sequence,
+        timestamp.value_or(std::uint32_t(sequence) * 240)
+    );
     require(bool(result), "Test SRTP protect failed");
     return {result.packet.begin(), result.packet.end()};
   }
@@ -535,6 +538,160 @@ void formatAndIndependentMix()
   sources[1] = &first;
   require(!AudioReceiver::mix(sources, output), "Mix accepted same source twice");
 }
+
+// 真实 Opus/SRTP 加虚拟到达时钟：0..15ms 抖动会产生乱序和批交付，20ms 等待应容纳它们。
+void fixedPrebufferSurvivesReorder()
+{
+  struct Delivery
+  {
+    std::uint64_t at;
+    Bytes bytes;
+  };
+  DirectPackets packets;
+  std::vector<Delivery> deliveries;
+  constexpr std::uint64_t start = 1000000000;
+  for (std::uint16_t sequence = 0; sequence < 200; ++sequence) {
+    const auto jitter = sequence == 0 ? 0 : (sequence * 7U) % 16U;
+    deliveries.push_back({start + (sequence * 5 + jitter) * ms, packets.packet(sequence)});
+  }
+  std::stable_sort(deliveries.begin(), deliveries.end(), [](const auto &a, const auto &b) { return a.at < b.at; });
+  ReceiverOptions options;
+  options.prebufferMs = 20;
+  AudioReceiver receiver({48000, 2}, 5, config(), key(), options);
+  std::array<float, 480> output{};
+  std::size_t next = 0;
+  // 到达 PLL 可轻微调整最后一包期限；留 4ms 余量但不越过下一包的名义播放周期。
+  for (unsigned time = 0; time <= 1019; ++time) {
+    const auto now = start + time * ms;
+    while (next < deliveries.size() && deliveries[next].at <= now) {
+      require(receiver.ingest(deliveries[next].bytes, now), "20ms prebuffer rejected bounded reordered delivery");
+      ++next;
+    }
+    receiver.tick(now, now);
+    if (time < 20)
+      require(receiver.stats().decodedPackets == 0, "Media decoded before fixed prebuffer deadline");
+    if (time % 5 == 0)
+      (void)receiver.render(output, now);
+  }
+  const auto stats = receiver.stats();
+  require(stats.decodedPackets == 200 && !stats.requiresReanchor, "Buffered stream did not finish normally");
+  require(stats.jitterLatePackets == 0 && stats.jitterLostPackets == 0, "Bounded jitter caused media loss");
+  require(
+      stats.playbackFrames <= 1440 && stats.playbackRejectedFrames == 0,
+      "Media prebuffer incorrectly accumulated decoded PCM"
+  );
+}
+
+// 十二包队列不能用 16 位序号直接取模记录到达时间；跨 65535 回绕后，
+// 仍应为每一包准确记录 20ms 驻留时间，避免长期运行的诊断数据被覆盖。
+void fixedPrebufferAcrossSequenceWrap()
+{
+  DirectPackets packets;
+  ReceiverOptions options;
+  options.prebufferMs = 20;
+  AudioReceiver receiver({48000, 2}, 5, config(), key(), options);
+  constexpr std::uint64_t start = 1000000000;
+  std::array<float, 480> output{};
+  for (unsigned time = 0; time <= 115; time += 5) {
+    const auto now = start + time * ms;
+    if (time < 100) {
+      const auto extended = 65530U + time / 5;
+      require(
+          receiver.ingest(packets.packet(static_cast<std::uint16_t>(extended), extended * 240), now),
+          "Fixed prebuffer rejected sequence wrap"
+      );
+    }
+    receiver.tick(now, now);
+    (void)receiver.render(output, now);
+  }
+  const auto stats = receiver.stats();
+  require(stats.decodedPackets == 20 && !stats.requiresReanchor, "Sequence wrap stopped buffered media");
+  require(stats.jitterResidenceNsTotal == 20 * 20 * ms, "Sequence wrap overwrote buffered arrival statistics");
+}
+
+// 分别验证媒体偏移、线程停顿、无媒体三类原因；恢复保留原密钥、防重放及用户静音状态。
+void authorizedRecoveryPreservesReplayProtection()
+{
+  constexpr std::uint64_t start = 1000000000;
+  for (const auto reason :
+       {RecoveryReason::MediaTimeline, RecoveryReason::DecoderStall, RecoveryReason::MediaTimeout}) {
+    DirectPackets packets;
+    ReceiverOptions options;
+    options.prebufferMs = 20;
+    AudioReceiver receiver({48000, 2}, 5, config(), key(), options);
+    receiver.setMuted(true);
+    auto first = packets.packet(0);
+    require(receiver.ingest(first, start), "Recovery fixture initial authentication failed");
+    receiver.tick(start + 20 * ms);
+    std::array<float, 480> output{};
+    (void)receiver.render(output, start + 20 * ms);
+    auto beforeAuthorization = packets.packet(1);
+    std::uint64_t resumeAt = start + 110 * ms;
+    if (reason == RecoveryReason::MediaTimeline) {
+      require(!receiver.ingest(beforeAuthorization, start + 100 * ms), "Large media phase jump was ignored");
+    } else if (reason == RecoveryReason::DecoderStall) {
+      receiver.tick(start + 100 * ms);
+    } else {
+      for (unsigned time = 25; time <= 1010; time += 5) {
+        receiver.tick(start + time * ms);
+        (void)receiver.render(output, start + time * ms);
+      }
+      resumeAt = start + 1100 * ms;
+    }
+    require(receiver.stats().recoveryReason == reason, "Recovery reason was misclassified");
+    require(!receiver.ingest(beforeAuthorization, resumeAt), "UDP reset a timeline before trusted authorization");
+    require(
+        receiver.authorizeReanchor({1, 240}, receiver.stats().recoveryEpoch), "Current recovery authorization failed"
+    );
+    auto resumed = packets.packet(2);
+    auto corrupt = resumed;
+    corrupt.back() ^= 1;
+    require(!receiver.ingest(corrupt, resumeAt), "Corrupt packet consumed recovery authorization");
+    require(!receiver.ingest(first, resumeAt), "Reanchor cleared the SRTP replay window");
+    require(receiver.ingest(resumed, resumeAt), "Authorized next media packet did not restore the timeline");
+    (void)receiver.render(output, resumeAt); // reader 确认清空旧 PCM 后才能发布恢复后的声音。
+    receiver.tick(resumeAt + 19 * ms);
+    require(receiver.stats().decodedPackets == 1, "Recovery skipped the fixed prebuffer interval");
+    receiver.tick(resumeAt + 20 * ms);
+    const auto stats = receiver.stats();
+    require(
+        stats.decodedPackets == 2 && !stats.requiresReanchor && receiver.muted(),
+        "Recovery lost decoder progress or changed user mute"
+    );
+    require(
+        stats.timelineRecoveries + stats.schedulerRecoveries + stats.timeoutRecoveries == 1,
+        "One recovery episode was counted repeatedly"
+    );
+    require(!receiver.ingest(resumed, resumeAt + 21 * ms), "Recovered packet could be replayed");
+  }
+}
+// 模拟可信回复早于首包，以及同一批 UDP 内刚重锚又发生偏移；旧轮次不能代替新授权。
+void recoveryAuthorizationTracksEpoch()
+{
+  constexpr std::uint64_t start = 1000000000;
+  DirectPackets packets;
+  AudioReceiver receiver({48000, 2}, 5, config(), key());
+  require(!receiver.authorizeReanchor({0, 0}, 0), "Initial progress was incorrectly marked as an active authorization");
+  require(receiver.ingest(packets.packet(1), start), "Initial packet did not establish its own timeline");
+  require(!receiver.ingest(packets.packet(21), start), "Batched timeline jump did not request recovery");
+  const auto firstEpoch = receiver.stats().recoveryEpoch;
+  require(firstEpoch == 1, "First recovery did not advance its epoch");
+  require(!receiver.authorizeReanchor({21, 21 * 240}, 0), "Initial progress reply authorized a later fault");
+  require(receiver.authorizeReanchor({21, 21 * 240}, firstEpoch), "First active recovery rejected trusted progress");
+  const auto resumed = packets.packet(22);
+  require(receiver.ingest(resumed, start), "Authorized media did not reanchor");
+  // 不插入 tick 或 Session 状态检查，直接交付第二个偏移包，复现一次排空内遗漏恢复完成。
+  require(!receiver.ingest(packets.packet(42), start), "Immediate second timeline jump was ignored");
+  const auto secondEpoch = receiver.stats().recoveryEpoch;
+  require(secondEpoch == firstEpoch + 1, "Second fault reused the consumed recovery epoch");
+  require(!receiver.authorizeReanchor({42, 42 * 240}, firstEpoch), "Stale epoch authorized a different recovery");
+  require(!receiver.ingest(packets.packet(43), start), "Second fault retained the first authorization");
+  require(receiver.authorizeReanchor({43, 43 * 240}, secondEpoch), "New epoch could not be authorized again");
+  require(receiver.ingest(packets.packet(44), start), "New trusted progress did not restore media");
+  require(!receiver.stats().requiresReanchor, "Second recovery remained stuck awaiting authorization");
+  require(!receiver.authorizeReanchor({44, 44 * 240}, secondEpoch), "Completed recovery still accepted authorization");
+  require(!receiver.ingest(resumed, start), "Recovery epoch reset the SRTP replay window");
+}
 } // namespace
 int main()
 {
@@ -557,6 +714,10 @@ int main()
     longGapRequiresTrustedResume();
     lateReorderedPacketCannotStopForwardMedia();
     bandLimitedDeviceIntegration();
+    fixedPrebufferSurvivesReorder();
+    fixedPrebufferAcrossSequenceWrap();
+    authorizedRecoveryPreservesReplayProtection();
+    recoveryAuthorizationTracksEpoch();
     std::cout << "Engine tests passed: worker/auth/5ms-startup/PLC/mute/overload/timeline/format/mix\n";
     return 0;
   } catch (const std::exception &error) {

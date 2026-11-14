@@ -149,6 +149,12 @@ if(DESKFLOW_AUDIO_BUILD_TESTS)
     target_link_libraries(audio-preview-session-tests PRIVATE deskflow-audio-session)
     add_test(NAME audio-preview-session COMMAND audio-preview-session-tests)
     set_tests_properties(audio-preview-session PROPERTIES TIMEOUT 30)
+    # 多个真实等待场景独立运行，保持原会话测试的超时预算，不访问实际声卡。
+    add_test(NAME audio-preview-recovery COMMAND audio-preview-session-tests --recovery)
+    set_tests_properties(audio-preview-recovery PROPERTIES TIMEOUT 60)
+    # 恢复轮次、首包回复先于 UDP、接近五秒的声卡启动及八秒无回复上限单独验收。
+    add_test(NAME audio-preview-recovery-timing COMMAND audio-preview-session-tests --recovery-timing)
+    set_tests_properties(audio-preview-recovery-timing PROPERTIES TIMEOUT 35)
     add_executable(audio-wasapi-tests windows/tests/WasapiBackendTests.cpp)
     set_target_properties(audio-wasapi-tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
     target_compile_definitions(audio-wasapi-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)

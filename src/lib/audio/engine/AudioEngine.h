@@ -9,6 +9,7 @@
 #include "../transport/SrtpTransport.h"
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace deskflow::audio::engine {
@@ -76,6 +77,23 @@ struct SenderStats
   bool highResolutionWait = false, coarseWaitFallback = false;
 };
 
+// 同一条媒体流中的位置，只能通过已认证控制通道授予恢复权限；不包含密钥。
+struct MediaPosition
+{
+  std::uint16_t sequence = 0;
+  std::uint32_t timestamp = 0;
+};
+
+// 区分网络媒体偏移、接收线程调度停顿与媒体超时，避免把所有恢复都归因为弱网。
+enum class RecoveryReason
+{
+  None,
+  MediaTimeline,
+  DecoderStall,
+  MediaTimeout
+};
+const char *recoveryReasonName(RecoveryReason reason) noexcept;
+
 // One capture producer, one internal encoding/SRTP/sink worker. Construct off realtime.
 // Format/key changes require stopping and constructing a NEW object with fresh key+SSRC.
 // start() is one-shot: a stopped/failed sender cannot restart its SRTP packet index.
@@ -98,6 +116,8 @@ public:
   [[nodiscard]] std::size_t adaptationLatencyInputFrames() const noexcept;
   [[nodiscard]] EngineStatus status() const noexcept;
   [[nodiscard]] SenderStats stats() const noexcept;
+  // 原子读取最近已加密的位置；未产生媒体时为空，不触碰编码器或 SRTP 状态。
+  [[nodiscard]] std::optional<MediaPosition> mediaPosition() const noexcept;
 
 private:
   struct Impl;
@@ -112,6 +132,9 @@ struct ReceiverOptions
   // nonthrowing, return promptly in production, and share ingest/render's clock domain.
   void *feedbackClockContext = nullptr;
   std::uint64_t (*feedbackClock)(void *) noexcept = nullptr;
+  // 固定媒体包预缓冲；主程序使用 20ms，底层诊断保留原来的 5ms 基线。
+  // 这是压缩包的等待时间，不改变 30/25/12ms 的 PCM 播放水位模型。
+  std::uint32_t prebufferMs = 5;
 };
 struct ReceiverStats
 {
@@ -128,6 +151,10 @@ struct ReceiverStats
   double networkClockCorrectionPpm = 0;           // Arrival/deadline mapping, not physical clock measurement.
   std::uint64_t playbackResidenceFrames = 0, playbackResidenceNsTotal = 0, playbackResidenceNsMax = 0;
   std::uint64_t feedbackUpdates = 0, feedbackConflicts = 0, feedbackInvalid = 0, feedbackCooldown = 0;
+  RecoveryReason recoveryReason = RecoveryReason::None;
+  std::uint64_t timelineRecoveries = 0, schedulerRecoveries = 0, timeoutRecoveries = 0;
+  // 每次进入新的重锚状态递增；即使同一批 UDP 内恢复后再次故障，也能区分两次授权。
+  std::uint64_t recoveryEpoch = 0;
 };
 
 // Per-source decoder state. The application owns ONE decoder worker which serially
@@ -149,10 +176,14 @@ public:
   void tick(std::uint64_t nowNs, std::uint64_t feedbackNs = 0) noexcept;
   // EXPLICIT trusted control-plane media reanchor, same authorized format/key/SSRC.
   // Does not reset SRTP replay/ROC, change config or unmute. Call on decoder worker.
-  // First authenticated packet automatically anchors INITIAL startup only (5ms).
+  // 首个认证包只自动建立初始时间线，等待 ReceiverOptions 指定的固定媒体预缓冲。
   // Device reader must acknowledge old PCM flush via render/mix. Decoder output
   // before that acknowledgement is counted in reanchorDiscardedMediaFrames.
   void reanchor(std::uint16_t sequence, std::uint32_t timestamp, std::uint64_t nowNs) noexcept;
+  // 仅由可信控制通道回复调用：等待此位置之后的首个认证媒体包再预缓冲。
+  // 必须匹配当前恢复轮次；尚未暂停或轮次已改变时返回 false，调用方不能记为授权成功。
+  // 不清理 SRTP 防重放窗口，不允许任意 UDP 包自行重置时间线；同一 worker 串行调用。
+  [[nodiscard]] bool authorizeReanchor(MediaPosition position, std::uint64_t recoveryEpoch) noexcept;
   // Optional explicit callback-entry clock, same domain as ingest/tick. Zero queries
   // monotonicNowNs(). Enables deterministic clock-domain simulation; never mix domains.
   [[nodiscard]] bool render(std::span<float> output, std::uint64_t callbackNs = 0) noexcept;

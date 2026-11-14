@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
+#include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -41,6 +42,13 @@ StreamConfig checkedConfig(std::uint32_t ms, StreamConfig config)
     throw std::invalid_argument("Engine requires matching 5/10ms, 48kHz stereo stream configuration");
   }
   return config;
+}
+// 限定实验缓冲范围；窗口同时容纳预缓冲包与原来的八包处理余量。
+std::uint64_t checkedPrebufferNs(std::uint32_t ms)
+{
+  if (ms < 5 || ms > 80)
+    throw std::invalid_argument("Media prebuffer must be between 5 and 80 milliseconds");
+  return ms * kMillisecond;
 }
 std::uint64_t addSaturated(std::uint64_t a, std::uint64_t b) noexcept
 {
@@ -103,6 +111,21 @@ std::uint64_t monotonicNowNs() noexcept
   );
 }
 
+// 稳定的诊断原因码不受界面翻译影响，日志只记录计数和原因，不包含凭据。
+const char *recoveryReasonName(RecoveryReason reason) noexcept
+{
+  switch (reason) {
+  case RecoveryReason::MediaTimeline:
+    return "media-timeline";
+  case RecoveryReason::DecoderStall:
+    return "decoder-stall";
+  case RecoveryReason::MediaTimeout:
+    return "media-timeout";
+  default:
+    return "none";
+  }
+}
+
 struct AudioSender::Impl
 {
   const PcmFormat input;
@@ -121,6 +144,7 @@ struct AudioSender::Impl
   std::atomic<std::size_t> queued{0};
   std::atomic<std::uint64_t> timingSamples{0}, residenceTotal{0}, residenceMax{0}, encodeTotal{0}, encodeMax{0};
   std::atomic<bool> highResolutionWait{false}, coarseWaitFallback{false};
+  std::atomic<std::uint64_t> protectedPosition{0}; // 扩展序号加一；零代表尚未加密任何媒体包。
 
   Impl(PcmFormat in, std::uint32_t ms, StreamConfig cfg, SrtpKey &&key, PacketSink output, SenderOptions opts)
       : input(in),
@@ -224,6 +248,7 @@ struct AudioSender::Impl
         }
         haveProtected = true;
         lastProtected = info.sequence; // Even sink rejection has irrevocably consumed this index.
+        protectedPosition.store(info.sequence + 1, std::memory_order_release);
         if (sink(packet.packet)) {
           sent.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -309,11 +334,24 @@ SenderStats AudioSender::stats() const noexcept
   };
 }
 
+// 将同一次加密的序号和时间戳一起发布，避免跨线程分别读取造成不一致。
+std::optional<MediaPosition> AudioSender::mediaPosition() const noexcept
+{
+  const auto position = m_impl->protectedPosition.load(std::memory_order_acquire);
+  if (!position)
+    return std::nullopt;
+  const auto sequence = position - 1;
+  return MediaPosition{
+      static_cast<std::uint16_t>(sequence), static_cast<std::uint32_t>(sequence * m_impl->config.frameSamples)
+  };
+}
+
 struct AudioReceiver::Impl
 {
   const PcmFormat device;
   const StreamConfig config;
   const std::uint64_t durationNs;
+  const std::uint64_t prebufferNs;
   const ReceiverOptions options;
   codec::OpusCodec codec;
   transport::SrtpReceiver transport;
@@ -333,8 +371,12 @@ struct AudioReceiver::Impl
   bool started = false, outputBreak = true;
   unsigned consecutiveLosses = 0;
   std::uint64_t lastTimestamp = 0, nextDeadline = 0;
-  std::array<std::uint64_t, 8> arrivalNs{};
+  std::vector<std::uint64_t> arrivalNs;
   std::atomic<bool> needsReanchor{false};
+  std::atomic<std::uint64_t> recoveryEpoch{0};
+  std::atomic<RecoveryReason> recoveryReason{RecoveryReason::None};
+  std::atomic<std::uint64_t> timelineRecoveries{0}, schedulerRecoveries{0}, timeoutRecoveries{0};
+  std::optional<MediaPosition> authorizedPosition; // 只能由可信控制回复设置，认证媒体包才能消费。
   std::atomic<std::uint64_t> jitterLost{0}, jitterLate{0}, timingSamples{0};
   std::atomic<std::uint64_t> decodeTotal{0}, decodeMax{0}, residenceTotal{0}, residenceMax{0}, reanchorDiscarded{0};
   std::atomic<bool> flushReader{false};
@@ -351,11 +393,12 @@ struct AudioReceiver::Impl
       : device(output),
         config(checkedConfig(ms, cfg)),
         durationNs(ms * kMillisecond),
+        prebufferNs(checkedPrebufferNs(opts.prebufferMs)),
         options(opts),
         codec(config.frameSamples),
         transport(config, std::move(key)),
-        jitter(8, transport::kMaxPayloadBytes, config.frameSamples, durationNs),
-        networkClock(durationNs),
+        jitter(8 + (opts.prebufferMs + ms - 1) / ms, transport::kMaxPayloadBytes, config.frameSamples, durationNs),
+        networkClock(durationNs, prebufferNs),
         adapter(kMediaFormat, device),
         playback(
             device, device.framesForDuration(30),
@@ -365,20 +408,23 @@ struct AudioReceiver::Impl
             dsp::DriftConfig{
                 double(device.sampleRate) * 0.012, 3.0 * 48000.0 / device.sampleRate, 0.1 * 48000.0 / device.sampleRate
             }
-        )
+        ),
+        arrivalNs(8 + (opts.prebufferMs + ms - 1) / ms)
   {
     status.state.store(EngineState::Running, std::memory_order_release);
   }
   void anchor(std::uint16_t sequence, std::uint32_t timestamp, std::uint64_t nowNs, bool flush) noexcept
   {
-    nextDeadline = addSaturated(nowNs, 5 * kMillisecond);
+    nextDeadline = addSaturated(nowNs, prebufferNs);
     jitter.start(config.generation, sequence, timestamp, nextDeadline);
     networkClock.reset();
     networkCorrection.store(0, std::memory_order_relaxed);
     lastArrivalNs = nowNs;
     haveForwardSequence = false;
-    arrivalNs.fill(0);
+    std::fill(arrivalNs.begin(), arrivalNs.end(), 0);
     needsReanchor.store(false, std::memory_order_relaxed);
+    recoveryReason.store(RecoveryReason::None, std::memory_order_relaxed);
+    authorizedPosition.reset();
     started = true;
     lastTimestamp = timestamp;
     consecutiveLosses = 0;
@@ -394,6 +440,24 @@ struct AudioReceiver::Impl
       // on this writer thread; volume/mute and SPSC ownership remain intact.
       flushReader.store(true, std::memory_order_release);
     }
+  }
+  // 每次故障只计数一次；暂停解码并请求 reader 清空旧 PCM，不重置密码学上下文。
+  void requestReanchor(RecoveryReason reason) noexcept
+  {
+    if (needsReanchor.load(std::memory_order_relaxed))
+      return;
+    jitter.stop();
+    authorizedPosition.reset();
+    // 授权只属于本次暂停；不能让上层遗漏的短暂恢复把旧授权带到下一次故障。
+    recoveryEpoch.fetch_add(1, std::memory_order_relaxed);
+    recoveryReason.store(reason, std::memory_order_relaxed);
+    auto &counter = reason == RecoveryReason::MediaTimeline  ? timelineRecoveries
+                    : reason == RecoveryReason::DecoderStall ? schedulerRecoveries
+                                                             : timeoutRecoveries;
+    counter.fetch_add(1, std::memory_order_relaxed);
+    needsReanchor.store(true, std::memory_order_relaxed);
+    flushReader.store(true, std::memory_order_release);
+    publish();
   }
   bool prepareReader() noexcept
   {
@@ -508,19 +572,25 @@ bool AudioReceiver::ingest(std::span<const std::uint8_t> datagram, std::uint64_t
     // This binds only the initial media timeline, NEVER config/key/SSRC/generation.
     m_impl->anchor(received.metadata.sequence, received.metadata.timestamp, nowNs, false);
   }
-  if (m_impl->needsReanchor.load(std::memory_order_relaxed))
-    return false;
+  if (m_impl->needsReanchor.load(std::memory_order_relaxed)) {
+    if (!m_impl->authorizedPosition)
+      return false;
+    const auto position = *m_impl->authorizedPosition;
+    const auto delta = static_cast<std::uint16_t>(received.metadata.sequence - position.sequence);
+    // 只接纳授权位置之后且时间戳连续的认证包；旧包、重复包和半序号空间跳跃均不能恢复。
+    if (!delta || delta >= 32768 ||
+        received.metadata.timestamp != position.timestamp + std::uint32_t(delta) * m_impl->config.frameSamples)
+      return false;
+    m_impl->anchor(received.metadata.sequence, received.metadata.timestamp, nowNs, true);
+  }
   const auto mappedDeadline = m_impl->jitter.deadlineFor(received.metadata.sequence);
-  const auto desiredDeadline = addSaturated(nowNs, 5 * kMillisecond);
+  const auto desiredDeadline = addSaturated(nowNs, m_impl->prebufferNs);
   const auto phaseError =
       desiredDeadline >= mappedDeadline ? desiredDeadline - mappedDeadline : mappedDeadline - desiredDeadline;
   const auto forwardDelta = static_cast<std::uint16_t>(received.metadata.sequence - m_impl->lastForwardSequence);
   const bool forward = !m_impl->haveForwardSequence || (forwardDelta != 0 && forwardDelta < 32768);
   if (forward && phaseError > 40 * kMillisecond) {
-    m_impl->jitter.stop();
-    m_impl->needsReanchor.store(true, std::memory_order_relaxed);
-    m_impl->flushReader.store(true, std::memory_order_release);
-    m_impl->publish();
+    m_impl->requestReanchor(RecoveryReason::MediaTimeline);
     return false; // Only the trusted control plane can recover a discontinuous media clock.
   }
   if (forward) {
@@ -541,7 +611,9 @@ bool AudioReceiver::ingest(std::span<const std::uint8_t> datagram, std::uint64_t
     m_impl->publish();
     return false;
   }
-  m_impl->arrivalNs[received.metadata.sequence % 8] = nowNs;
+  // 队列容量不一定整除 65536，不能直接用 16 位序号取模；跨序号回绕时会覆盖
+  // 仍在预缓冲的旧包统计。使用已经扩展为连续值的媒体时间戳保持槽位唯一。
+  m_impl->arrivalNs[(timestamp / m_impl->config.frameSamples) % m_impl->arrivalNs.size()] = nowNs;
   if (delta > 0) {
     m_impl->lastTimestamp = timestamp;
   }
@@ -553,17 +625,16 @@ void AudioReceiver::tick(std::uint64_t nowNs, std::uint64_t feedbackNs) noexcept
   if (m_impl->status.state.load(std::memory_order_acquire) != EngineState::Running) {
     return;
   }
-  if (m_impl->started && ((nowNs > m_impl->nextDeadline && nowNs - m_impl->nextDeadline > m_impl->durationNs * 8) ||
-                          (nowNs > m_impl->lastArrivalNs && nowNs - m_impl->lastArrivalNs > 1000 * kMillisecond))) {
+  if (m_impl->needsReanchor.load(std::memory_order_relaxed))
+    return;
+  const bool stalled =
+      m_impl->started && nowNs > m_impl->nextDeadline && nowNs - m_impl->nextDeadline > m_impl->durationNs * 8;
+  const bool timedOut =
+      m_impl->started && nowNs > m_impl->lastArrivalNs && nowNs - m_impl->lastArrivalNs > 1000 * kMillisecond;
+  if (stalled || timedOut) {
     // A severe scheduler stall is NOT permission to reanchor from UDP. Stop media
     // decisions and request an explicit trusted reanchor instead of chasing stale PLC.
-    m_impl->jitter.stop();
-    m_impl->needsReanchor.store(true, std::memory_order_relaxed);
-    m_impl->flushReader.store(true, std::memory_order_release);
-    m_impl->publish();
-    return;
-  }
-  if (m_impl->needsReanchor.load(std::memory_order_relaxed)) {
+    m_impl->requestReanchor(stalled ? RecoveryReason::DecoderStall : RecoveryReason::MediaTimeout);
     return;
   }
   // Bound scheduler catch-up independently of jitter capacity. Never generate an
@@ -582,7 +653,8 @@ void AudioReceiver::tick(std::uint64_t nowNs, std::uint64_t feedbackNs) noexcept
       const auto frames =
           m_impl->codec.decode(std::span<const std::uint8_t>(m_impl->opus.data(), packet.bytes), m_impl->pcm);
       recordTiming(m_impl->decodeTotal, m_impl->decodeMax, monotonicNowNs() - decodeStart);
-      const auto arrival = m_impl->arrivalNs[packet.info.sequence % 8];
+      const auto arrival =
+          m_impl->arrivalNs[(packet.info.timestampFrames / m_impl->config.frameSamples) % m_impl->arrivalNs.size()];
       if (nowNs >= arrival) {
         recordTiming(m_impl->residenceTotal, m_impl->residenceMax, nowNs - arrival);
       }
@@ -654,6 +726,15 @@ void AudioReceiver::tick(std::uint64_t nowNs, std::uint64_t feedbackNs) noexcept
 void AudioReceiver::reanchor(std::uint16_t sequence, std::uint32_t timestamp, std::uint64_t nowNs) noexcept
 {
   m_impl->anchor(sequence, timestamp, nowNs, true);
+}
+// 该授权只应用于已暂停的流；真正重设播放时间线仍需下一包通过原 SRTP 验证。
+bool AudioReceiver::authorizeReanchor(MediaPosition position, std::uint64_t recoveryEpoch) noexcept
+{
+  if (!m_impl->needsReanchor.load(std::memory_order_relaxed) ||
+      m_impl->recoveryEpoch.load(std::memory_order_relaxed) != recoveryEpoch)
+    return false;
+  m_impl->authorizedPosition = position;
+  return true;
 }
 bool AudioReceiver::render(std::span<float> output, std::uint64_t callbackNs) noexcept
 {
@@ -807,7 +888,12 @@ ReceiverStats AudioReceiver::stats() const noexcept
       m_impl->feedbackUpdates.load(std::memory_order_relaxed),
       m_impl->feedbackConflicts.load(std::memory_order_relaxed),
       m_impl->feedbackInvalid.load(std::memory_order_relaxed),
-      m_impl->feedbackCooldown.load(std::memory_order_relaxed)
+      m_impl->feedbackCooldown.load(std::memory_order_relaxed),
+      m_impl->recoveryReason.load(std::memory_order_relaxed),
+      m_impl->timelineRecoveries.load(std::memory_order_relaxed),
+      m_impl->schedulerRecoveries.load(std::memory_order_relaxed),
+      m_impl->timeoutRecoveries.load(std::memory_order_relaxed),
+      m_impl->recoveryEpoch.load(std::memory_order_relaxed)
   };
 }
 } // namespace deskflow::audio::engine
