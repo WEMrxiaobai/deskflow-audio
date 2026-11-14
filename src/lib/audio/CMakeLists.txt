@@ -155,6 +155,18 @@ if(DESKFLOW_AUDIO_BUILD_TESTS)
     # 恢复轮次、首包回复先于 UDP、接近五秒的声卡启动及八秒无回复上限单独验收。
     add_test(NAME audio-preview-recovery-timing COMMAND audio-preview-session-tests --recovery-timing)
     set_tests_properties(audio-preview-recovery-timing PROPERTIES TIMEOUT 35)
+    # 真实 Session + GUI 后台任务包装器的契约回归，不链接 Qt、不替换媒体函数或访问声卡。
+    # 四个独立进程分别覆盖收发方向及新旧恢复能力，避免进程内单任务租约影响对端配对。
+    add_executable(audio-session-worker-media-tests tests/AudioSessionWorkerMediaTests.cpp ../gui/audio/AudioSessionWorker.cpp)
+    set_target_properties(audio-session-worker-media-tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    target_compile_options(audio-session-worker-media-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    target_link_libraries(audio-session-worker-media-tests PRIVATE deskflow-audio-session)
+    foreach(role send receive)
+      foreach(mode legacy recovery)
+        add_test(NAME audio-worker-${role}-${mode} COMMAND audio-session-worker-media-tests ${role} ${mode})
+        set_tests_properties(audio-worker-${role}-${mode} PROPERTIES TIMEOUT 15)
+      endforeach()
+    endforeach()
     add_executable(audio-wasapi-tests windows/tests/WasapiBackendTests.cpp)
     set_target_properties(audio-wasapi-tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
     target_compile_definitions(audio-wasapi-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)

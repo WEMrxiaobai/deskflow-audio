@@ -118,7 +118,7 @@ add_library(${target} STATIC
 )
 
 if(WIN32 AND ENABLE_AUDIO_SHARING)
-  target_sources(${target} PRIVATE widgets/AudioSharingWidget.cpp widgets/AudioSharingWidget.h audio/PairedAudioControl.cpp audio/PairedAudioControl.h)
+  target_sources(${target} PRIVATE widgets/AudioSharingWidget.cpp widgets/AudioSharingWidget.h audio/PairedAudioControl.cpp audio/PairedAudioControl.h audio/AudioSessionWorker.cpp audio/AudioSessionWorker.h)
   target_compile_definitions(${target} PRIVATE DESKFLOW_AUDIO_SHARING=1)
   target_compile_options(${target} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
   target_link_libraries(${target} PUBLIC deskflow-audio-session)
@@ -141,6 +141,10 @@ if(WIN32 AND ENABLE_AUDIO_SHARING)
   add_executable(deskflow-mainwindow-audio-tests EXCLUDE_FROM_ALL ../audio/tests/MainWindowIntegrationTests.cpp ../../apps/res/deskflow.qrc)
   target_compile_options(deskflow-mainwindow-audio-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
   target_link_libraries(deskflow-mainwindow-audio-tests PRIVATE gui)
+  # 合成后台任务模拟耗时退出，不打开声卡；检查界面响应、停止隔离和统一重试门槛。
+  add_executable(deskflow-audio-worker-tests EXCLUDE_FROM_ALL ../audio/tests/AudioSessionWorkerTests.cpp)
+  target_compile_options(deskflow-audio-worker-tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+  target_link_libraries(deskflow-audio-worker-tests PRIVATE gui)
 endif()
 
 target_link_libraries(${target}
