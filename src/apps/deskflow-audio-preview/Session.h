@@ -71,6 +71,12 @@ private:
   std::mutex m_mutex;
   std::optional<RecoveryMessage> m_pending;
 };
+// 纯合成集成测试向时钟驱动器报告真实媒体进度，不包含密钥、UDP 内容或设备引用。
+// 已完成采集块只计已发送、已丢弃或已过期的块，驱动器不能靠推进时钟跳过尚未处理的工作。
+struct SessionTestProgress
+{
+  std::uint64_t capturedBlocks = 0, completedBlocks = 0, sentPackets = 0, receivedPackets = 0;
+};
 struct SessionOptions
 {
   bool receive = false;
@@ -81,6 +87,10 @@ struct SessionOptions
   // 仅合成/设备诊断模式使用：默认五秒，较长时序回归可覆盖声卡启动预算后的恢复超时。
   // 不影响正式共享的运行期限；测试仍须满足原媒体数量校验或主动停止。
   std::chrono::milliseconds testDuration{5000};
+  // 仅限 test=true 且不访问声卡的正向集成测试；为空时始终使用真实单调时钟。
+  // 回调在普通 Session worker 上执行，可用收发进度屏障推进单调媒体时间；握手、
+  // 编码队列过期和外层测试看门狗仍用真实时间。禁止用于正式共享及真实声卡诊断。
+  std::function<std::uint64_t(const SessionTestProgress &)> testClock;
   // 发送端可选本机播放策略；所有者必须保持原子变量存活，直到 runSession 和资源清理结束。
   // GUI 使用后台共享状态承载它，销毁控件不等待线程。空指针保留 CLI 的原行为。
   const std::atomic<bool> *localPlayback = nullptr;

@@ -149,6 +149,9 @@ if(DESKFLOW_AUDIO_BUILD_TESTS)
     target_link_libraries(audio-preview-session-tests PRIVATE deskflow-audio-session)
     add_test(NAME audio-preview-session COMMAND audio-preview-session-tests)
     set_tests_properties(audio-preview-session PROPERTIES TIMEOUT 30)
+    # 真实 Session 配合合成采集短停顿，验证媒体帧数不会随发送 worker 迟到累计漂移。
+    add_test(NAME audio-preview-synthetic-capture COMMAND audio-preview-session-tests --synthetic-capture)
+    set_tests_properties(audio-preview-synthetic-capture PROPERTIES TIMEOUT 15)
     # 多个真实等待场景独立运行，保持原会话测试的超时预算，不访问实际声卡。
     add_test(NAME audio-preview-recovery COMMAND audio-preview-session-tests --recovery)
     set_tests_properties(audio-preview-recovery PROPERTIES TIMEOUT 60)

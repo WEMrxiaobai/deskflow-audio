@@ -6,9 +6,12 @@
 // test 模式只生成合成音频并解码丢弃，不访问声卡、本机静音、产品配置或信任记录。
 #include "gui/audio/AudioSessionWorker.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -20,6 +23,57 @@ void check(bool value, const std::string &message)
     throw std::runtime_error(message);
 }
 
+// 此套测试验收方向/能力协商与真实媒体传输，不把 Windows 调度实时性当成旧端契约。
+// 两端每轮提交真实计数，只有采集块处理完且已发送 UDP 全部认证后才推进 1ms 媒体时间；
+// 编码、SRTP、socket 和参数校验均不替换，阻塞或丢包仍由真实时间看门狗判失败。
+class SteppedMediaClock final
+{
+public:
+  std::uint64_t step(bool receive, const preview::SessionTestProgress &progress)
+  {
+    std::unique_lock lock(m_mutex);
+    check(!m_cancelled, "Media test clock was cancelled by its peer");
+    const auto round = m_round;
+    m_progress[receive ? 1 : 0] = progress;
+    if (++m_arrivals == 2) {
+      if (!m_now) {
+        m_now = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count()
+        );
+      } else if (m_progress[0].completedBlocks >= m_progress[0].capturedBlocks &&
+                 m_progress[1].receivedPackets >= m_progress[0].sentPackets) {
+        m_now += 1000000;
+      }
+      m_arrivals = 0;
+      ++m_round;
+      m_changed.notify_all();
+    } else if (!m_changed.wait_for(lock, 4500ms, [&] { return m_cancelled || m_round != round; })) {
+      m_cancelled = true;
+      m_changed.notify_all();
+      throw std::runtime_error("Timed out waiting for real Session peer progress");
+    }
+    check(!m_cancelled, "Media test clock was cancelled by its peer");
+    return m_now;
+  }
+
+  // 异常与析构都唤醒对端，保证失败不会把后台 worker 留在测试屏障里。
+  void cancel()
+  {
+    std::lock_guard lock(m_mutex);
+    m_cancelled = true;
+    m_changed.notify_all();
+  }
+
+private:
+  std::mutex m_mutex;
+  std::condition_variable m_changed;
+  std::array<preview::SessionTestProgress, 2> m_progress{};
+  unsigned m_arrivals = 0;
+  std::uint64_t m_round = 0, m_now = 0;
+  bool m_cancelled = false;
+};
+
 // 对端直接运行真实 Session，包装器仍保持进程内仅一个任务的产品约束。
 // 失败路径也先停止并等待对端退出，选项和回调引用不会先于线程失效。
 struct PeerSession
@@ -28,12 +82,15 @@ struct PeerSession
   std::atomic<bool> stop{false}, done{false}, connected{false};
   std::atomic<std::uint64_t> packets{0};
   std::thread thread;
+  std::shared_ptr<SteppedMediaClock> clock;
   std::string failure;
   std::string lastDiagnostic, failureReason;
 
   ~PeerSession()
   {
     stop = true;
+    if (clock)
+      clock->cancel();
     if (thread.joinable())
       thread.join();
     if (options.invitation)
@@ -57,6 +114,7 @@ struct PeerSession
         });
       } catch (const std::exception &error) {
         failure = std::string(error.what()) + "; reason=" + failureReason + "; " + lastDiagnostic;
+        clock->cancel();
       }
       // 发布完成后主线程才读取 failure，避免为错误字符串增加并发读写。
       done = true;
@@ -72,8 +130,11 @@ void transfer(bool receive, bool recovery)
   std::promise<preview::Invitation> ready;
   auto offered = ready.get_future();
   PeerSession peer;
+  const auto clock = std::make_shared<SteppedMediaClock>();
+  peer.clock = clock;
   peer.options.receive = !receive;
   peer.options.test = true;
+  peer.options.testClock = [clock, receive](const auto &progress) { return clock->step(!receive, progress); };
   peer.options.recovery = peerInbox;
   if (recovery)
     peer.options.onRecovery = [workerInbox](const auto &message) { workerInbox->post(message); };
@@ -86,6 +147,7 @@ void transfer(bool receive, bool recovery)
   preview::SessionOptions options;
   options.receive = receive;
   options.test = true;
+  options.testClock = [clock, receive](const auto &progress) { return clock->step(receive, progress); };
   options.recovery = workerInbox;
   if (!receive)
     options.invitation = offered.get();
@@ -133,12 +195,14 @@ void transfer(bool receive, bool recovery)
       break;
     std::this_thread::sleep_for(1ms);
   }
-  // 完整五秒测试同时断言双方确实运行和媒体数量，不能只以“不再抛校验异常”作为通过。
+  // 完整五秒媒体时间仍要求双方至少 600 包；外层九秒真实时间同时约束屏障与实际传输。
+  // 独立的真实时间恢复测试继续验证 40ms 保护、调度停顿、超时及不可达，不使用此时钟。
   check(finished && peer.done, "worker/peer did not finish within deadline");
   check(connected && peer.connected, "worker/peer did not connect");
   check(packets >= 600 && peer.packets >= 600, "worker/peer did not transfer enough real media");
   std::cout << "role=" << (receive ? "receiver" : "sender") << " recovery=" << recovery << " worker_packets=" << packets
-            << " peer_packets=" << peer.packets.load() << " real_session=1 real_opus_srtp=1 hardware=0\n";
+            << " peer_packets=" << peer.packets.load()
+            << " real_session=1 real_opus_srtp=1 hardware=0 stepped_media_clock=1\n";
 }
 } // namespace
 

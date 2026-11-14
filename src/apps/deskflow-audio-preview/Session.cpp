@@ -210,6 +210,8 @@ void runInternal(
     throw std::invalid_argument("testRender requires a receiving test session");
   if (testCapture && (!test || receive))
     throw std::invalid_argument("testCapture requires a sending test session");
+  if (options.testClock && (!test || testRender || testCapture))
+    throw std::invalid_argument("testClock requires a synthetic session without device access");
   if (test &&
       (options.testDuration <= std::chrono::milliseconds::zero() || options.testDuration > std::chrono::minutes(1)))
     throw std::invalid_argument("testDuration must be between 1 and 60000 milliseconds");
@@ -419,7 +421,24 @@ void runInternal(
                                      : "已连接：正在播放远端系统声音（初始音量35%）。")
               : "已连接：正在发送系统声音，请在本机播放音乐。"
   );
-  auto start = ae::monotonicNowNs(), nextTone = start, nextRender = start, nextReport = start;
+  // 默认保持生产单调时钟。只有纯合成测试可协调两端进度后推进媒体时间，避免把
+  // 宿主机偶发失去调度误当成正向兼容测试的网络故障；真实握手及队列过期不被替换。
+  const auto workerNow = [&] {
+    if (!options.testClock)
+      return ae::monotonicNowNs();
+    preview::SessionTestProgress progress;
+    if (receive) {
+      progress.receivedPackets = receiver->stats().authenticatedPackets;
+    } else {
+      const auto stats = sender->stats();
+      progress.capturedBlocks = stats.capturedBlocks;
+      progress.completedBlocks =
+          stats.sentPackets + stats.sinkDroppedPackets + stats.suppressedPackets + stats.expiredBlocks;
+      progress.sentPackets = stats.sentPackets;
+    }
+    return options.testClock(progress);
+  };
+  auto start = workerNow(), nextTone = start, nextRender = start, nextReport = start;
   const auto keyDeadline =
       start +
       static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(options.mediaKeyLifetime).count()
@@ -485,14 +504,14 @@ void runInternal(
     }
   } failureDiagnostic{reportDiagnostic};
   while (!stopping) {
-    const auto now = ae::monotonicNowNs();
+    const auto now = workerNow();
     const auto loopGapNs = now - lastLoopNs;
     lastLoopNs = now;
     maxLoopGapNs = std::max(maxLoopGapNs, loopGapNs);
     // 长时间未调度时先让引擎记录 worker 停顿，再排空积压 UDP；否则批交付旧包
     // 会先触发媒体偏移保护，掩盖本机调度停顿。正常轮询仍先收包，避免提前判丢。
     if (receive && loopGapNs > 40000000ULL)
-      receiver->tick(now);
+      receiver->tick(now, options.testClock ? now : 0);
     if (now >= keyDeadline) {
       keyExpired = true;
       reportDiagnostic("media-key-lifetime");
@@ -593,18 +612,21 @@ void runInternal(
         answeredRequest = senderRequest;
       }
     }
-    if (test && !receive && !testCapture && now >= nextTone) {
+    // 合成采集与真实声卡一样按样本数推进媒体时钟，不能在 worker 迟到后把 nextTone
+    // 重设为 now：那会漏掉媒体槽，多次短停顿累积成虚假的网络时间线偏移。
+    // 每轮最多补交八个采集块，仍由原有四块队列和编码 worker 丢弃过期块；携带原计划
+    // 采集时间，让积压数据遵守原 10ms 年龄限制，不把旧音频伪装成刚产生的实时声音。
+    for (unsigned work = 0; test && !receive && !testCapture && now >= nextTone && work < 8; ++work) {
       for (std::size_t i = 0; i < 240; ++i, ++frame)
         tone[2 * i] = tone[2 * i + 1] = .01f * std::sin(float(frame % 48000) * 6.2831853f * 440 / 48000);
-      (void)sender->capture(tone, false, now);
+      // 编码队列的年龄属于真实 CPU/采集时钟，受控媒体时钟不能关闭这项过期保护。
+      (void)sender->capture(tone, false, options.testClock ? ae::monotonicNowNs() : nextTone);
       nextTone += 5000000;
-      if (now > nextTone + 5000000)
-        nextTone = now + 5000000;
     }
     if (receive) {
-      receiver->tick(now);
+      receiver->tick(now, options.testClock ? now : 0);
       if (test && !testRender && now >= nextRender) {
-        (void)receiver->render(discard);
+        (void)receiver->render(discard, options.testClock ? now : 0);
         for (float sample : discard)
           decodedPeak = std::max(decodedPeak, std::abs(sample));
         nextRender += 5000000;

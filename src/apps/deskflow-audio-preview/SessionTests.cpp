@@ -72,6 +72,14 @@ void validation()
   rejects([&] { preview::runSession(receiver, stop); });
   receiver.testDuration = 60001ms;
   rejects([&] { preview::runSession(receiver, stop); });
+  // 可控时钟只能用于纯合成测试，防止正式共享或真实设备被测试时间替代。
+  receiver = memoryReceiver();
+  receiver.testClock = [](const auto &) { return std::uint64_t(1); };
+  receiver.test = false;
+  rejects([&] { preview::runSession(receiver, stop); });
+  receiver.test = true;
+  receiver.testRender = true;
+  rejects([&] { preview::runSession(receiver, stop); });
   preview::SessionOptions sender;
   sender.test = true;
   sender.invitation.emplace();
@@ -209,7 +217,7 @@ void rejectsUnauthenticatedHello()
   check(!connected, "Receiver accepted a Hello without the authenticated offer secret");
 }
 // 合成音频、回环 UDP 与可信回调邮箱，不访问声卡；故意暂停接收 worker 后检验同会话恢复。
-void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey = false)
+void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey = false, bool capturePauses = false)
 {
   auto receiver = memoryReceiver();
   std::atomic<bool> receiverStop{false}, senderStop{false};
@@ -221,7 +229,9 @@ void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey 
   bool paused = false;
   bool recoveryTimedOut = false;
   bool schedulerReported = false;
+  bool timelineReported = false;
   bool initialNoMediaReply = false;
+  unsigned capturePauseCount = 0;
   auto receiverInbox = std::make_shared<preview::SessionRecovery>();
   auto senderInbox = std::make_shared<preview::SessionRecovery>();
   // 五秒基线与新 GUI 一样协商恢复能力，宿主机短暂停顿应由产品机制自行恢复。
@@ -248,6 +258,7 @@ void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey 
       recovered += event.state == preview::SessionState::Recovered;
       recoveryTimedOut |= event.state == preview::SessionState::Failed && event.reason == "media-recovery-timeout";
       schedulerReported |= event.state == preview::SessionState::Recovering && event.reason == "decoder-stall";
+      timelineReported |= event.state == preview::SessionState::Recovering && event.reason == "media-timeline";
       // 首次稳定播放后暂停 120ms，模拟 CPU 调度卡顿与内核批交付，避免只测试主动调用接口。
       if (recover && !paused && event.state == preview::SessionState::Connected && event.packets > 50) {
         paused = true;
@@ -264,7 +275,7 @@ void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey 
     if (!renewKey) {
       sender.recovery = senderInbox;
       sender.onRecovery = [receiverInbox](const auto &message) { receiverInbox->post(message); };
-    } else {
+    } else if (renewKey) {
       // sender 在生成首个合成采集回调之前处理查询，必须明确回复尚无媒体，不能一直不回。
       sender.recovery = senderInbox;
       senderInbox->post({false, 1});
@@ -276,6 +287,14 @@ void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey 
       preview::runSession(sender, senderStop, [&](const auto &event) {
         sent = std::max(sent, event.packets);
         renewing += event.state == preview::SessionState::Renewing;
+        // 发送端普通 worker 的三次短暂停顿总和超过 40ms，但不能造成媒体时钟累计落后。
+        // 若合成采集遗漏了媒体槽，就会触发时间线保护；接收端自己的偶发调度停顿仍由
+        // 原可信恢复机制处理，不能将宿主机实时调度能力混入这个发送端媒体时钟断言。
+        if (capturePauses && capturePauseCount < 3 && event.state == preview::SessionState::Connected &&
+            event.packets > 50) {
+          ++capturePauseCount;
+          std::this_thread::sleep_for(25ms);
+        }
       });
     } catch (...) {
       preview::erase(*sender.invitation);
@@ -324,6 +343,11 @@ void memoryPair(bool recover = false, bool answerRecovery = true, bool renewKey 
     check(renewing == 1, "Media key lifetime did not request a fresh session independently");
   if (renewKey)
     check(initialNoMediaReply, "Sender did not report the absence of an initial media packet");
+  if (capturePauses)
+    check(
+        capturePauseCount == 3 && !timelineReported,
+        "Synthetic capture lost its fixed media clock during short source-worker pauses"
+    );
   std::cout << "memory_pair_sent=" << sent << " decoded=" << received << " onReady=" << readyCalls << '\n';
 }
 
@@ -665,6 +689,10 @@ void mediaReachability(ReachabilityCase scenario)
 int main(int argc, char **argv)
 {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--synthetic-capture") {
+      memoryPair(false, true, false, true);
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--recovery") {
       for (const auto scenario :
            {ReachabilityCase::UdpBeforeReply, ReachabilityCase::ReplyBeforeUdp, ReachabilityCase::MediaBlocked,
