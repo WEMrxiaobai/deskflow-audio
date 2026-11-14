@@ -88,13 +88,24 @@ struct PacketBox
     changed.notify_all();
   }
 };
+// 测试断言失败时也先解除 sink 屏障，再析构并等待编码线程，避免错误路径卡住测试进程。
+struct PacketRelease
+{
+  PacketBox &box;
+  ~PacketRelease()
+  {
+    box.release();
+  }
+};
 void asyncAuthenticatedLoopback()
 {
   PacketBox box;
   AudioSender sender({48000, 2}, 5, config(), key(), [&](auto packet) { return box.put(packet); });
   require(sender.status().state == EngineState::Ready, "Sender should initially be Ready");
   sender.start();
-  require(sender.capture(tone(), false, monotonicNowNs()), "Low-level capture rejected");
+  // 此处验证异步编解码而非采集延迟；零时间戳表示没有设备墙钟，媒体年龄保护仍生效。
+  // 真实墙钟过期由 wallExpiredCaptureIsDiscarded() 单独验证，不能依赖 worker 恰好及时启动。
+  require(sender.capture(tone(), false, 0), "Low-level capture rejected");
   box.wait(1);
   sender.stop();
   require(box.sinkThread != std::this_thread::get_id(), "Sink/codec ran on capture thread");
@@ -294,8 +305,9 @@ void overloadBoundedAndMediaTimeline()
   PacketBox box;
   box.block = true;
   AudioSender sender({48000, 2}, 5, config(), key(), [&](auto packet) { return box.put(packet); });
+  PacketRelease release{box};
   sender.start();
-  require(sender.capture(tone(), false, monotonicNowNs()), "Initial capture failed");
+  require(sender.capture(tone(), false, 0), "Initial capture failed");
   box.wait(1);
   // While encoder/sink is held, capture must return immediately and reject newest
   // blocks beyond its FOUR slots, without waiting for worker/network progress.
@@ -310,7 +322,7 @@ void overloadBoundedAndMediaTimeline()
     std::this_thread::yield();
   }
   require(sender.stats().expiredBlocks >= 4, "Consumer did not discard stale PCM");
-  require(sender.capture(tone(), true, monotonicNowNs()), "Post-overload capture failed");
+  require(sender.capture(tone(), true, 0), "Post-overload capture failed");
   box.wait(2);
   sender.stop();
   transport::SrtpReceiver verify(config(), key());
@@ -323,6 +335,38 @@ void overloadBoundedAndMediaTimeline()
   require(
       second.metadata.timestamp == std::uint32_t(second.metadata.sequence) * 240,
       "RTP timestamp no longer agrees with dropped media sequence slots"
+  );
+}
+// 只让第二块的真实采集时间过期，保持媒体帧年龄小于两块；证明 10ms 墙钟保护仍独立生效。
+// 用已在过去的时间戳构造期限，不假设宿主机能在某个很短的 sleep 内切换线程。
+void wallExpiredCaptureIsDiscarded()
+{
+  PacketBox box;
+  box.block = true;
+  AudioSender sender({48000, 2}, 5, config(), key(), [&](auto packet) { return box.put(packet); });
+  PacketRelease release{box};
+  sender.start();
+  require(sender.capture(tone(), false, 0), "Expiry fixture initial capture failed");
+  box.wait(1);
+  require(sender.capture(tone(), false, monotonicNowNs() - 11 * ms), "Expiry fixture capture failed");
+  box.release();
+  const auto deadline = monotonicNowNs() + 3'000 * ms;
+  while (!sender.stats().expiredBlocks && monotonicNowNs() < deadline)
+    std::this_thread::yield();
+  require(
+      sender.stats().expiredBlocks == 1 && sender.stats().encodedPackets == 1,
+      "Wall-expired capture was encoded or media-only age replaced wall age"
+  );
+  require(sender.capture(tone(), true, 0), "Expiry fixture resumed capture failed");
+  box.wait(2);
+  sender.stop();
+  transport::SrtpReceiver verify(config(), key());
+  const auto first = verify.unprotect(box.packets[0]);
+  const auto resumed = verify.unprotect(box.packets[1]);
+  require(
+      first && resumed && resumed.metadata.sequence == first.metadata.sequence + 2 &&
+          resumed.metadata.timestamp == first.metadata.timestamp + 480,
+      "Expired capture reused a media sequence or changed authenticated timestamps"
   );
 }
 void exactZeroGateSignals()
@@ -340,15 +384,15 @@ void exactZeroGateSignals()
   };
   AudioSender sender({48000, 2}, 5, config(), key(), [&](auto packet) { return box.put(packet); }, options);
   sender.start();
-  require(sender.capture(tone(0.000001f), false, monotonicNowNs()), "Enabled gate rejected low level");
+  require(sender.capture(tone(0.000001f), false, 0), "Enabled gate rejected low level");
   box.wait(1);
   const std::array<float, 480> zeros{};
   for (unsigned index = 0; index < 39; ++index) {
-    require(sender.capture(zeros, false, monotonicNowNs()), "Exact-zero capture failed");
+    require(sender.capture(zeros, false, 0), "Exact-zero capture failed");
     box.wait(index + 2);
   }
   require(entered.load(std::memory_order_relaxed) == 0, "Gate suppressed before 200ms exact zeros");
-  require(sender.capture(zeros, false, monotonicNowNs()), "200ms zero capture failed");
+  require(sender.capture(zeros, false, 0), "200ms zero capture failed");
   const auto deadline = monotonicNowNs() + 3'000 * ms;
   while (sender.stats().suppressedPackets == 0 && monotonicNowNs() < deadline) {
     std::this_thread::yield();
@@ -357,7 +401,7 @@ void exactZeroGateSignals()
       sender.stats().suppressedPackets == 1 && entered.load(std::memory_order_relaxed) == 1,
       "Gate did not explicitly signal entry at 200ms"
   );
-  require(sender.capture(tone(0.000001f), false, monotonicNowNs()), "Gate resume capture failed");
+  require(sender.capture(tone(0.000001f), false, 0), "Gate resume capture failed");
   box.wait(41);
   sender.stop();
   require(resumed.load(std::memory_order_relaxed) == 1, "Gate resume missing trusted signalling callback");
@@ -385,7 +429,7 @@ void workerExceptionAndGateContract()
   require(rejected, "Gate enabled without explicit trusted signalling callback");
   AudioSender throwing({48000, 2}, 5, config(), key(), [](auto) -> bool { throw std::runtime_error("test sink"); });
   throwing.start();
-  require(throwing.capture(tone(), false, monotonicNowNs()), "Throw test capture failed");
+  require(throwing.capture(tone(), false, 0), "Throw test capture failed");
   const auto deadline = monotonicNowNs() + 3'000 * ms;
   while (throwing.status().state != EngineState::Failed && monotonicNowNs() < deadline) {
     std::this_thread::yield();
@@ -452,7 +496,7 @@ void tenMillisecondLoopback()
   const auto half = tone();
   std::copy(half.begin(), half.end(), pcm.begin());
   std::copy(half.begin(), half.end(), pcm.begin() + 480);
-  require(sender.capture(pcm, false, monotonicNowNs()), "10ms capture failed");
+  require(sender.capture(pcm, false, 0), "10ms capture failed");
   box.wait(1);
   sender.stop();
   AudioReceiver receiver({48000, 2}, 10, config(480), key());
@@ -472,8 +516,8 @@ void bandLimitedDeviceIntegration()
   std::array<float, 960> input{};
   for (std::size_t frame = 0; frame < input.size() / 2; ++frame)
     input[frame * 2] = input[frame * 2 + 1] = .05f * std::sin(float(frame) * .2f);
-  require(sender.capture(input, false, monotonicNowNs()), "96k first callback rejected");
-  require(sender.capture(input, false, monotonicNowNs()), "96k second callback rejected");
+  require(sender.capture(input, false, 0), "96k first callback rejected");
+  require(sender.capture(input, false, 0), "96k second callback rejected");
   box.wait(1);
   sender.stop();
   AudioReceiver receiver({44100, 1}, 5, config(), key());
@@ -705,6 +749,7 @@ int main()
     lossFreezesPlaybackFeedback();
     callbackBetweenDecodeAndObservationMakesProgress();
     overloadBoundedAndMediaTimeline();
+    wallExpiredCaptureIsDiscarded();
     exactZeroGateSignals();
     workerExceptionAndGateContract();
     trustedReanchorFlushAndPlaybackCap();
