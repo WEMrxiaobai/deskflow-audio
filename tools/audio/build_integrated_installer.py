@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import subprocess
+import shutil
 import uuid
 import json
 import zipfile
@@ -68,6 +69,38 @@ def rtf_escape(text: str) -> str:
     return "".join(output)
 
 
+def build_startup_cleanup(work: Path, cmake: Path | None) -> Path:
+    """构建不依赖 Qt/动态 CRT 的 x64 MSI 清理 DLL，仅编译，绝不执行清理。"""
+    executable = cmake or shutil.which("cmake")
+    if not executable:
+        raise ValueError("CMake is required to build the startup cleanup action; supply --cmake")
+    output = work / "autostart-cleanup"
+    subprocess.run([str(executable), "-S", str(ROOT / "tools/audio/windows-autostart-cleanup"),
+                    "-B", str(output), "-A", "x64", "-DBUILD_TESTING=OFF"], check=True)
+    subprocess.run([str(executable), "--build", str(output), "--config", "Release",
+                    "--target", "DeskflowAutoStartCleanup"], check=True)
+    return (output / "Release/DeskflowAutoStartCleanup.dll").resolve(strict=True)
+
+
+def add_startup_cleanup(product, dll: Path) -> None:
+    """按用户清理所属此安装目录的启动项；升级卸载与失败回滚必须保留用户启动意愿。"""
+    # Binary 表嵌入原生 DLL，执行时由 MSI 解包；不能从 RemoveFiles 已删除的应用目录加载。
+    element(product, "Binary", Id="DeskflowStartupCleanupBinary", SourceFile=str(dll))
+    sequence = element(product, "InstallExecuteSequence")
+    uninstall = 'Installed AND REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE'
+    for action, execution, condition in [
+        ("DeskflowCleanupStartupCommit", "commit", uninstall + " AND NOT RollbackDisabled"),
+        ("DeskflowCleanupStartupNoRollback", "deferred", uninstall + " AND RollbackDisabled"),
+    ]:
+        # 正常卸载在提交成功后才清理，回滚不丢启动项；禁用回滚时在 RemoveFiles 后清理。
+        # 两个分支互斥，只有最终卸载会运行。损坏用户 hive 的错误写入日志，不阻塞卸载。
+        element(product, "CustomAction", Id=action, BinaryKey="DeskflowStartupCleanupBinary",
+                DllEntry="CleanDeskflowAutoStart", Execute=execution, Impersonate="no", Return="ignore")
+        element(product, "SetProperty", Id=action, Value="[INSTALLFOLDER]deskflow.exe",
+                Before=action, Sequence="execute", text=condition)
+        element(sequence, "Custom", Action=action, Before="InstallFinalize", text=condition)
+
+
 def validate_stage(stage: Path) -> None:
     required = [
         "deskflow.exe", "deskflow-core.exe", "deskflow-daemon.exe", "deskflow-audio-mute-watchdog.exe",
@@ -97,6 +130,7 @@ def build(args) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     work = output.parent / (output.stem + "-build")
     work.mkdir(parents=True, exist_ok=True)
+    cleanup_dll = build_startup_cleanup(work, args.cmake)
     # Keep runtime/licenses intact. Source and build recipes are delivered next
     # to the MSI, never installed into Program Files. Do not mutate the stage.
     source_prefixes = ("docs/third-party/sources/", "docs/third-party/qt-build-config/",
@@ -169,7 +203,7 @@ def build(args) -> Path:
         "在插耳机的电脑勾选“在本机收听其他电脑”，已配对的对端自动发送声音；关闭开关停止音频。\n"
         "发送端新增“共享时本机也播放”，默认关闭并记住；共享成功后临时静音本机，停止后恢复。\n"
         "音频开关会记住；键鼠重连后自动恢复。不采麦克风、不录音、不修改系统音量数值。\n"
-        "卸载会移除本包服务和防火墙例外，但保留原用户配置。\n"
+        "卸载会移除本包服务、防火墙例外及指向本安装目录的各用户登录启动项，但保留原用户配置。\n"
         "安装前请主动退出当前 Deskflow，保存工作。\n",
         encoding="utf-8",
     )
@@ -194,6 +228,7 @@ def build(args) -> Path:
     element(product, "MajorUpgrade", Schedule="afterInstallInitialize",
             DowngradeErrorMessage="已安装更高版本的 Deskflow；请勿用此开发包降级。")
     element(product, "MediaTemplate", EmbedCab="yes", CompressionLevel="high")
+    add_startup_cleanup(product, cleanup_dll)
     element(product, "Condition", Message="此开发构建需要64位Windows，面向Windows 10/11。",
             text="Installed OR VersionNT64")
     element(product, "Property", Id="ARPCOMMENTS", Value="Unsigned development build with experimental audio. Upgrades Deskflow.")
@@ -310,7 +345,8 @@ def main():
     parser.add_argument("--source-zip", type=Path, required=True, help="Application source ZIP; published in separate companion, never installed")
     parser.add_argument("--output", type=Path, default=ROOT / f"build/Deskflow-Audio-Unified-{VERSION}-win-x64.msi")
     parser.add_argument("--skip-ice", action="store_true", help="Explicitly skip ICE only when host Windows Installer service is unavailable")
-    parser.add_argument("--emit-only", action="store_true", help="Emit WiX source only, without invoking build tools")
+    parser.add_argument("--emit-only", action="store_true", help="Build cleanup DLL and emit WiX source without invoking WiX")
+    parser.add_argument("--cmake", type=Path, help="CMake executable used to build the native startup cleanup DLL")
     args = parser.parse_args()
     build(args)
 

@@ -22,6 +22,29 @@ def rows(table):
             fields.append(text.value)
         result.append(fields);m.MsiCloseHandle(rec)
     m.MsiCloseHandle(view);return result
+
+# 从实际 MSI 表核对清理操作，不能仅凭 WiX 源码中存在清理节点就认定卸载已覆盖。
+# 3649 = DLL + continue + commit + in-script + no-impersonate；3137 为对应 deferred 分支。
+cleanup_actions = {row[0]: row for row in rows('CustomAction')}
+cleanup_schedule = {row[0]: row for row in rows('InstallExecuteSequence')}
+for action, action_type, rollback_condition in [
+    ('DeskflowCleanupStartupCommit', 3649, 'NOT RollbackDisabled'),
+    ('DeskflowCleanupStartupNoRollback', 3137, 'RollbackDisabled'),
+]:
+    actual = cleanup_actions[action]
+    assert int(actual[1]) == action_type, actual
+    assert actual[2:4] == ['DeskflowStartupCleanupBinary', 'CleanDeskflowAutoStart'], actual
+    condition = 'Installed AND REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE AND ' + rollback_condition
+    assert cleanup_schedule[action][1] == condition, cleanup_schedule[action]
+    assert (int(cleanup_schedule['RemoveFiles'][2]) < int(cleanup_schedule[action][2])
+            < int(cleanup_schedule['InstallFinalize'][2])), cleanup_schedule[action]
+    # CustomActionData 必须在对应操作排入执行脚本前准备，且只能传本安装目录的目标路径。
+    setter = cleanup_actions['Set' + action]
+    assert setter[1:4] == ['51', action, '[INSTALLFOLDER]deskflow.exe'], setter
+    assert cleanup_schedule['Set' + action][1] == condition
+    assert int(cleanup_schedule['Set' + action][2]) < int(cleanup_schedule[action][2])
+print('Verified final-uninstall startup cleanup, upgrade exclusion and rollback scheduling')
+
 files=rows('File');names={row[2].split('|')[-1] for row in files}
 required={'deskflow-audio-mute-watchdog.exe','deskflow.exe','deskflow-core.exe','deskflow-daemon.exe','Qt6Core.dll','Qt6Widgets.dll','Qt6Gui.dll','Qt6Network.dll','Qt6Svg.dll','libssl-3-x64.dll','libcrypto-3-x64.dll','qwindows.dll','qopensslbackend.dll','deskflow_zh_CN.qm','vcruntime140.dll','msvcp140.dll'}
 assert required<=names,required-names
