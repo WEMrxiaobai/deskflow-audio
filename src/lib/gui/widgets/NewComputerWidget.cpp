@@ -21,8 +21,10 @@ NewComputerWidget::NewComputerWidget(QWidget *parent) : QLabel(parent)
 
 void NewComputerWidget::mousePressEvent(QMouseEvent *)
 {
-  //: Used as the hostname. Translation may not contain spaces
-  Computer newComputer(tr("Unnamed"));
+  // 此名称会随拖放数据写入服务端连接配置，并参与客户端名称匹配，不能作为界面文字翻译。
+  // 中文翻译“未命名”的 UTF-8 字节会被 core 配置解析器拒绝，导致整个键鼠服务端无法启动；
+  // 使用固定的 ASCII 占位名，用户仍需将其改为对端实际的计算机名称后才能正确连接。
+  Computer newComputer(QStringLiteral("Unnamed"));
 
   QByteArray itemData;
   QDataStream dataStream(&itemData, QIODevice::WriteOnly);

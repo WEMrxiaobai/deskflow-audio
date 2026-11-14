@@ -167,7 +167,17 @@ void exerciseControl(const QString &openssl)
   PairedAudioControl remote;
   QObject callbacks;
   int disconnects = 0;
+  int deliveredOffers = 0;
   QObject::connect(control, &PairedAudioControl::peerDisconnected, &callbacks, [&](const QString &) { ++disconnects; });
+  // 该观察器在控件自身的消息处理器之后运行；计数推进即表示邀请已经完成真实 TLS 解帧和 GUI 校验。
+  // 用它作为拒绝分支的事件屏障，避免仅凭短暂等待就误判“没有启动任务”。
+  QObject::connect(
+      control, &PairedAudioControl::messageReceived, &callbacks,
+      [&](const QString &, const QJsonObject &message) {
+        if (message.value("type") == QStringLiteral("offer"))
+          ++deliveredOffers;
+      }
+  );
   PairedAudioControl::Configuration sender, receiver;
   sender.useSettings = receiver.useSettings = false;
   sender.certificatePath = senderPem;
@@ -184,8 +194,11 @@ void exerciseControl(const QString &openssl)
   check(waitFor([&] { return control->peerIds().size() == 1 && remote.peerIds().size() == 1; }), "TLS did not pair");
   const auto peer = remote.peerIds().first();
   remote.send(peer, {{"type", "state"}, {"listen", true}, {"available", true}, {"recovery", true}});
-  auto sendOffer = [&](char id) {
+  auto sendOffer = [&](char id, std::uint64_t expires = 0) {
     auto invitation = preview::createInvitation(12345, {"127.0.0.1"});
+    // 仅改变来自可信对端的到期时间，模拟不同机器的墙上时钟；不修改系统时间或媒体单调时钟。
+    if (expires)
+      invitation.expiresUnixSeconds = expires;
     const QJsonObject offer{
         {"media",
          QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(invitation.mediaKey.data()), 30).toBase64())},
@@ -199,8 +212,18 @@ void exerciseControl(const QString &openssl)
     preview::erase(invitation);
   };
   const auto initial = fixture.started.load();
-  sendOffer('a');
-  check(waitFor([&] { return fixture.started == initial + 1; }), "TLS offer did not start audio");
+  // 容忍正常时钟偏差不能取消凭据边界：过期和超出媒体层上限的邀请仍须拒绝，且不启动声卡任务。
+  sendOffer('x', preview::unixSeconds() - 1);
+  check(waitFor([&] { return deliveredOffers == 1; }), "expired TLS offer was not delivered");
+  check(AudioSharingWidgetTestAccess::idle(widget), "expired TLS offer started audio");
+  sendOffer('y', preview::unixSeconds() + 670);
+  check(waitFor([&] { return deliveredOffers == 2; }), "future TLS offer was not delivered");
+  check(AudioSharingWidgetTestAccess::idle(widget), "excessively future TLS offer started audio");
+  check(fixture.started == initial, "invalid TLS offers started a background task");
+  // 邀请在对端仍有十分钟有效期；本机时钟慢十秒时会观察到 610 秒，必须接受而非静默丢弃。
+  // 此处走控件的真实接收校验和任务包装器，避免只测试绕过 GUI 的 Session 媒体接口。
+  sendOffer('a', preview::unixSeconds() + 610);
+  check(waitFor([&] { return fixture.started == initial + 1; }), "clock-skewed TLS offer did not start audio");
   remote.send(peer, {{"type", "stop"}, {"session", QString(32, 'a')}});
   check(waitFor([] { return fixture.stopping.load(); }), "TLS stop did not reach worker");
   sendOffer('b');

@@ -85,7 +85,8 @@ void validate(const Invitation &invite)
 {
   const auto now = unixSeconds();
   if (invite.port == 0 || invite.ssrc == 0 || invite.expiresUnixSeconds < now ||
-      invite.expiresUnixSeconds - now > 660 || invite.addresses.empty() || invite.addresses.size() > 8)
+      invite.expiresUnixSeconds - now > maxInvitationRemainingSeconds || invite.addresses.empty() ||
+      invite.addresses.size() > 8)
     fail("Invalid or expired audio invitation");
   for (std::size_t i = 0; i < invite.addresses.size(); ++i) {
     const auto &address = invite.addresses[i];
@@ -214,7 +215,7 @@ Invitation createInvitation(std::uint16_t port, std::vector<std::string> address
   InvitationGuard guard{result};
   result.port = port;
   result.addresses = std::move(addresses);
-  result.expiresUnixSeconds = unixSeconds() + 600;
+  result.expiresUnixSeconds = unixSeconds() + invitationLifetimeSeconds;
   do {
     randomBytes(std::span(reinterpret_cast<std::uint8_t *>(&result.ssrc), sizeof(result.ssrc)));
   } while (!result.ssrc);

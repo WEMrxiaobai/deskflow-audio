@@ -44,8 +44,11 @@ bool readOffer(const QJsonObject &json, const QString &address, preview::Invitat
   bool ipv4 = false;
   const auto ip = host.toIPv4Address(&ipv4);
   const auto now = preview::unixSeconds();
+  // 邀请由接收电脑按其本地时间签发；发送电脑时钟稍慢时，看到的剩余时间会超过十分钟。
+  // 与媒体层使用同一时钟余量，先检查到期再做无符号减法；仍拒绝过期和超出上限的邀请。
   if (media.size() != 30 || control.size() != 32 || !ssrcOk || !offer.ssrc || !expiresOk ||
-      offer.expiresUnixSeconds <= now || offer.expiresUnixSeconds > now + 600 || port < 1 || port > 65535 || !ipv4)
+      offer.expiresUnixSeconds <= now || offer.expiresUnixSeconds - now > preview::maxInvitationRemainingSeconds ||
+      port < 1 || port > 65535 || !ipv4)
     return false;
   std::copy(media.begin(), media.end(), offer.mediaKey.begin());
   std::copy(control.begin(), control.end(), offer.controlKey.begin());
@@ -301,6 +304,9 @@ void AudioSharingWidget::handleMessage(const QString &peer, const QJsonObject &m
       m_pendingOffer->session = session;
       m_pendingOffer->invitation = offer;
       reconcile();
+    } else {
+      // 只记录拒绝原因类别，不输出邀请、媒体密钥或完整控制消息，便于区分未发 UDP 与网络丢包。
+      qWarning("audio-session reason=invalid-audio-offer 音频邀请无效或已过期，等待重新协商。");
     }
     preview::erase(offer);
   }

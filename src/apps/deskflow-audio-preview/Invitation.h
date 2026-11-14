@@ -23,6 +23,12 @@
 // source endpoint, rejects replay, and accepts Stop only for its active session.
 // All APIs are worker/control-thread only; crypto and file operations allocate.
 namespace preview {
+// 邀请仍只签发十分钟；校验方额外容忍至多一分钟的墙上时钟偏差，避免对端时钟稍快时误拒绝。
+// GUI 与 UDP 认证共用同一上限；此余量不延长邀请中携带的到期时间，也不允许过期凭据重新建连。
+inline constexpr std::uint64_t invitationLifetimeSeconds = 600;
+inline constexpr std::uint64_t invitationClockSkewSeconds = 60;
+inline constexpr std::uint64_t maxInvitationRemainingSeconds = invitationLifetimeSeconds + invitationClockSkewSeconds;
+
 struct Invitation
 {
   std::array<std::uint8_t, 30> mediaKey{};

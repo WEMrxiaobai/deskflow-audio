@@ -27,7 +27,7 @@ WIX = "http://schemas.microsoft.com/wix/2006/wi"
 UTIL = "http://schemas.microsoft.com/wix/UtilExtension"
 FIREWALL = "http://schemas.microsoft.com/wix/FirewallExtension"
 UPGRADE_CODE = "027D1C8A-E7A5-4754-BB93-B2D45BFDBDC8"
-VERSION = "1.27.4"  # Packaging-only: separate corresponding source from runtime MSI.
+VERSION = "1.27.5"  # Packaging-only: separate corresponding source from runtime MSI.
 for prefix, namespace in [("", WIX), ("util", UTIL), ("firewall", FIREWALL)]:
     ET.register_namespace(prefix, namespace)
 
