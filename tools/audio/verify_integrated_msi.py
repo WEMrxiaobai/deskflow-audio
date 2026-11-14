@@ -31,6 +31,23 @@ assert len(rows('Dialog'))>=20
 services=rows('ServiceInstall');assert any(row[1]=='Deskflow' for row in services)
 firewall=rows('WixFirewallException');assert len(firewall)==3
 properties=dict((row[0],row[1]) for row in rows('Property'))
+if tuple(map(int,properties['ProductVersion'].split('.'))) >= (1,27,6):
+    # 检查编译后的 Shortcut/Directory/Component/FeatureComponents 表，而非只检查 WiX 源码。
+    # 入口必须落在标准桌面、直接指向 GUI，且归属于已安装功能，避免“有记录但组件不安装”。
+    desktop=[row for row in shortcuts if row[0]=='DeskflowDesktopShortcut']
+    assert len(desktop)==1, 'Missing or duplicate desktop shortcut'
+    shortcut=desktop[0]
+    assert shortcut[1:3]==['DesktopFolder','Deskflow'], shortcut
+    assert shortcut[4]=='[INSTALLFOLDER]deskflow.exe' and shortcut[11]=='INSTALLFOLDER', shortcut
+    assert any(row[0]=='DesktopFolder' and row[1]=='TARGETDIR' for row in rows('Directory'))
+    assert any(row[1]==shortcut[3] for row in rows('FeatureComponents')), 'Desktop component is not installed'
+    component=next(row for row in rows('Component') if row[0]==shortcut[3])
+    registry=next(row for row in rows('Registry') if row[0]==component[5])
+    assert int(component[3]) & 4 and registry[1]=='1', 'Shortcut component requires an HKCU registry KeyPath'
+    # 安装与卸载分别交由标准动作管理快捷方式，不额外运行脚本，不移除用户的桌面目录。
+    actions={row[0] for row in rows('InstallExecuteSequence')}
+    assert {'CreateShortcuts','RemoveShortcuts'}<=actions, 'Missing shortcut lifecycle actions'
+    print('Verified desktop shortcut target, feature ownership and install/uninstall actions')
 print(json.dumps({'product':properties['ProductName'],'version':properties['ProductVersion'],'files':len(files),'shortcuts':len(shortcuts),'services':len(services),'firewall_rules':len(firewall),'sha256':hashlib.sha256(args.msi.read_bytes()).hexdigest()},ensure_ascii=True,indent=2))
 # Verify actual compressed executable bytes, not only the File table entries.
 import subprocess

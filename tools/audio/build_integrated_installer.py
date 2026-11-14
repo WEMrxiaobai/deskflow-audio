@@ -27,7 +27,7 @@ WIX = "http://schemas.microsoft.com/wix/2006/wi"
 UTIL = "http://schemas.microsoft.com/wix/UtilExtension"
 FIREWALL = "http://schemas.microsoft.com/wix/FirewallExtension"
 UPGRADE_CODE = "027D1C8A-E7A5-4754-BB93-B2D45BFDBDC8"
-VERSION = "1.27.5"  # Packaging-only: separate corresponding source from runtime MSI.
+VERSION = "1.27.6"  # Packaging-only: separate corresponding source from runtime MSI.
 for prefix, namespace in [("", WIX), ("util", UTIL), ("firewall", FIREWALL)]:
     ET.register_namespace(prefix, namespace)
 
@@ -203,6 +203,8 @@ def build(args) -> Path:
     install = element(program_files, "Directory", Id="INSTALLFOLDER", Name="Deskflow")
     menu = element(element(root, "Directory", Id="ProgramMenuFolder"), "Directory",
                    Id="DeskflowMenuFolder", Name="Deskflow")
+    # 使用 MSI 标准桌面目录，避免硬编码用户名或 Desktop 路径；跟随安装上下文解析实际桌面。
+    element(root, "Directory", Id="DesktopFolder")
     directories = {"": install}
 
     def directory(relative: str):
@@ -248,10 +250,15 @@ def build(args) -> Path:
         element(feature, "ComponentRef", Id=comp_id)
     shortcuts = element(menu, "Component", Id="DeskflowMenuShortcuts",
                         Guid="DC8C6D23-39F9-4CB3-8DD0-3EC0E6718CD6", Win64="yes")
-    element(shortcuts, "RegistryValue", Root="HKLM", Key="Software\\Deskflow\\AudioDevelopment",
+    # 非发布型快捷方式需要 HKCU 注册表 KeyPath；桌面与开始菜单共用原组件，保证升级和卸载一并维护。
+    element(shortcuts, "RegistryValue", Root="HKCU", Key="Software\\Deskflow\\AudioDevelopment",
             Name="Installed", Type="integer", Value="1", KeyPath="yes")
     element(shortcuts, "Shortcut", Id="DeskflowGuiShortcut", Name="Deskflow", Target="[INSTALLFOLDER]deskflow.exe",
             WorkingDirectory="INSTALLFOLDER", Description="Deskflow桌面界面（含实验性音频共享）")
+    # 直接指向 GUI，不经命令脚本或服务进程；卸载由 RemoveShortcuts 移除本组件登记的 .lnk。
+    element(shortcuts, "Shortcut", Id="DeskflowDesktopShortcut", Directory="DesktopFolder", Name="Deskflow",
+            Target="[INSTALLFOLDER]deskflow.exe", WorkingDirectory="INSTALLFOLDER",
+            Description="Deskflow桌面界面（含实验性音频共享）")
     element(shortcuts, "Shortcut", Id="DeskflowAudioNotesShortcut", Name="音频开发版说明",
             Target="[INSTALLFOLDER]docs\\AudioDevelopment.txt", WorkingDirectory="INSTALLFOLDER")
     element(shortcuts, "RemoveFolder", Id="RemoveDeskflowMenu", On="uninstall")
